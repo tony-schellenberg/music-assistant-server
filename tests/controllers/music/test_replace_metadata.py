@@ -10,6 +10,7 @@ from music_assistant_models.media_items import MediaItemImage, MediaItemMetadata
 from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.controllers.music.media.artists import ArtistsController
+from music_assistant.controllers.music.media.tracks import TracksController
 from music_assistant.helpers.json import json_loads, serialize_to_json
 
 
@@ -24,7 +25,18 @@ def _make_controller(metadata: MediaItemMetadata) -> ArtistsController:
     return controller
 
 
-def _stored(controller: ArtistsController) -> MediaItemMetadata:
+def _make_track_controller(metadata: MediaItemMetadata) -> TracksController:
+    """Build a TracksController whose db row carries the given metadata."""
+    controller = TracksController.__new__(TracksController)
+    controller.mass = MagicMock()
+    raw_metadata = serialize_to_json(metadata)
+    controller.mass.music.database.get_row = AsyncMock(return_value={"metadata": raw_metadata})
+    controller.mass.music.database.update = AsyncMock()
+    controller.get_library_item = AsyncMock(return_value=MagicMock(uri="track://1"))  # type: ignore[method-assign]
+    return controller
+
+
+def _stored(controller: ArtistsController | TracksController) -> MediaItemMetadata:
     """Return the metadata the controller wrote to the database."""
     update_call = cast("MagicMock", controller.mass.music.database.update).call_args
     return MediaItemMetadata.from_dict(json_loads(update_call.args[2]["metadata"]))
@@ -94,3 +106,26 @@ async def test_replace_metadata_with_the_stored_values_is_a_noop() -> None:
 
     cast("AsyncMock", controller.mass.music.database.update).assert_not_called()
     cast("MagicMock", controller.mass.signal_event).assert_not_called()
+
+
+async def test_replace_track_lyrics_preserves_other_metadata() -> None:
+    """Replacing lyrics leaves unrelated track metadata untouched."""
+    controller = _make_track_controller(
+        MediaItemMetadata(
+            lyrics="Old lyrics",
+            lrc_lyrics="[00:01.00]Old lyrics",
+            description="Stored description",
+            genres={"Rock"},
+        )
+    )
+
+    await controller.replace_metadata(
+        1,
+        {"lyrics": "New lyrics", "lrc_lyrics": "[00:02.00]New lyrics"},
+    )
+
+    stored = _stored(controller)
+    assert stored.lyrics == "New lyrics"
+    assert stored.lrc_lyrics == "[00:02.00]New lyrics"
+    assert stored.description == "Stored description"
+    assert stored.genres == {"Rock"}

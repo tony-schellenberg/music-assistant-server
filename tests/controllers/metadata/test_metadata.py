@@ -376,12 +376,13 @@ async def test_get_track_lyrics_uses_resolved_provider_instance_for_primary_lyri
 async def test_get_track_lyrics_uses_stored_library_track_without_refresh(
     metadata_controller: MetaDataController, mass_minimal: MusicAssistant
 ) -> None:
-    """Metadata providers receive the canonical library item without a metadata refresh."""
+    """Metadata providers receive the canonical item and only fetched lyrics are stored."""
     stored = create_track("spotify_1", "track1")
     stored.item_id, stored.provider = "1", "library"
     stored.metadata.lyrics = "Stored plain lyrics"
     mass_minimal.music = MagicMock()
     mass_minimal.music.tracks.get = AsyncMock(return_value=stored)
+    mass_minimal.music.tracks.replace_metadata = AsyncMock()
     metadata_controller._update_track_metadata = AsyncMock()  # type: ignore[method-assign]
     synced = "[00:12.00]Synchronized lyrics"
     provider = _lyrics_metadata_provider(MediaItemMetadata(lrc_lyrics=synced))
@@ -391,8 +392,10 @@ async def test_get_track_lyrics_uses_stored_library_track_without_refresh(
     with patch.object(mass_minimal, "get_providers", return_value=[provider]):
         assert await metadata_controller.get_track_lyrics(track) == ("Stored plain lyrics", synced)
 
-    mass_minimal.music.tracks.get.assert_awaited_once_with(
-        "1", "library", allow_update_metadata=False
+    mass_minimal.music.tracks.get.assert_awaited_with("1", "library", allow_update_metadata=False)
+    assert mass_minimal.music.tracks.get.await_count == 2
+    mass_minimal.music.tracks.replace_metadata.assert_awaited_once_with(
+        "1", {"lyrics": "Stored plain lyrics", "lrc_lyrics": synced}
     )
     metadata_controller._update_track_metadata.assert_not_awaited()
     provider.get_track_metadata.assert_awaited_once_with(stored)
@@ -421,14 +424,92 @@ async def test_empty_library_lookup_continues_to_metadata_providers(
     ):
         assert await metadata_controller.get_track_lyrics(track) == (None, synced)
 
-    mass_minimal.music.tracks.get.assert_awaited_once_with(
-        "1", "library", allow_update_metadata=False
-    )
+    mass_minimal.music.tracks.get.assert_awaited_with("1", "library", allow_update_metadata=False)
+    assert mass_minimal.music.tracks.get.await_count == 2
     metadata_controller._update_track_metadata.assert_not_awaited()
     provider.get_track_metadata.assert_awaited_once_with(stored)
     assert stored.metadata.genres == {"Stored genre"}
     assert stored.metadata.lyrics is None
     assert stored.metadata.lrc_lyrics is None
+    mass_minimal.music.tracks.replace_metadata.assert_awaited_once_with(
+        "1", {"lyrics": None, "lrc_lyrics": synced}
+    )
+
+
+async def test_get_track_lyrics_saves_only_normalized_lyrics_as_server(
+    metadata_controller: MetaDataController, mass_minimal: MusicAssistant
+) -> None:
+    """The caller's visible library item is validated before only lyrics are saved as server."""
+    user = User(user_id="user-member", username="member", role=UserRole.USER)
+    stored = create_track("spotify_1", "track1")
+    stored.item_id, stored.provider = "1", "library"
+    stored.provider_mappings = set()
+    stored.metadata.genres = {"Stored genre"}
+    track = create_track("spotify_1", "track1")
+    track.item_id, track.provider = "1", "library"
+    track.provider_mappings = set()
+    provider_metadata = MediaItemMetadata(
+        lyrics="Fetched plain lyrics",
+        lrc_lyrics="[00:20.00]Later\n[00:10.00]Earlier",
+        description="Provider description",
+        genres={"Provider genre"},
+    )
+    provider = _lyrics_metadata_provider(provider_metadata)
+    users_during_reads: list[User | None] = []
+    users_during_writes: list[User | None] = []
+
+    async def get_library_track(*_: object, **__: object) -> Track:
+        users_during_reads.append(get_current_user())
+        return stored
+
+    async def replace_metadata(*_: object, **__: object) -> None:
+        users_during_writes.append(get_current_user())
+
+    mass_minimal.music = MagicMock()
+    mass_minimal.music.tracks.get = AsyncMock(side_effect=get_library_track)
+    mass_minimal.music.tracks.replace_metadata = AsyncMock(side_effect=replace_metadata)
+
+    user_token = current_user.set(user)
+    try:
+        with patch.object(mass_minimal, "get_providers", return_value=[provider]):
+            assert await metadata_controller.get_track_lyrics(track) == (
+                "Fetched plain lyrics",
+                "[00:10.00]Earlier\n[00:20.00]Later",
+            )
+        assert get_current_user() is user
+    finally:
+        current_user.reset(user_token)
+
+    assert users_during_reads == [user, user]
+    assert users_during_writes == [None]
+    mass_minimal.music.tracks.replace_metadata.assert_awaited_once_with(
+        "1",
+        {
+            "lyrics": "Fetched plain lyrics",
+            "lrc_lyrics": "[00:10.00]Earlier\n[00:20.00]Later",
+        },
+    )
+    assert stored.metadata.genres == {"Stored genre"}
+
+
+async def test_get_track_lyrics_does_not_clear_stored_lyrics(
+    metadata_controller: MetaDataController, mass_minimal: MusicAssistant
+) -> None:
+    """An empty provider result does not clear existing lyrics from a library item."""
+    stored = create_track("spotify_1", "track1")
+    stored.item_id, stored.provider = "1", "library"
+    stored.metadata.lyrics = "Stored plain lyrics"
+    track = create_track("spotify_1", "track1")
+    track.item_id, track.provider = "1", "library"
+    track.metadata.lyrics = "Stored plain lyrics"
+    provider = _lyrics_metadata_provider(None)
+    mass_minimal.music = MagicMock()
+    mass_minimal.music.tracks.get = AsyncMock(return_value=stored)
+    mass_minimal.music.tracks.replace_metadata = AsyncMock()
+
+    with patch.object(mass_minimal, "get_providers", return_value=[provider]):
+        assert await metadata_controller.get_track_lyrics(track) == ("Stored plain lyrics", None)
+
     mass_minimal.music.tracks.replace_metadata.assert_not_awaited()
 
 
@@ -465,12 +546,16 @@ async def test_stored_library_synced_lyrics_stop_before_provider_discovery(
     track.item_id, track.provider = "1", "library"
     mass_minimal.music = MagicMock()
     mass_minimal.music.tracks.get = AsyncMock(return_value=stored)
+    mass_minimal.music.tracks.replace_metadata = AsyncMock()
 
     with patch.object(mass_minimal, "get_providers") as get_providers:
         assert await metadata_controller.get_track_lyrics(track) == (None, synced)
 
     mass_minimal.music.get_visible_provider.assert_not_called()
     get_providers.assert_not_called()
+    mass_minimal.music.tracks.replace_metadata.assert_awaited_once_with(
+        "1", {"lyrics": None, "lrc_lyrics": synced}
+    )
 
 
 async def test_library_music_sources_follow_mapping_priority_and_stop_on_synced_lyrics(
@@ -490,6 +575,7 @@ async def test_library_music_sources_follow_mapping_priority_and_stop_on_synced_
     track.item_id, track.provider = "1", "library"
     mass_minimal.music = MagicMock()
     mass_minimal.music.tracks.get = AsyncMock(return_value=stored)
+    mass_minimal.music.tracks.replace_metadata = AsyncMock()
     mass_minimal.music.tracks.get_provider_item = AsyncMock()
     metadata_controller._update_track_metadata = AsyncMock()  # type: ignore[method-assign]
     mass_minimal.music.get_visible_provider.side_effect = lambda provider, **_: {
@@ -537,6 +623,7 @@ async def test_duplicate_streaming_provider_mappings_are_queried_once(
     second_provider = _music_lyrics_provider("spotify_2", "spotify", streaming=True)
     mass_minimal.music = MagicMock()
     mass_minimal.music.tracks.get = AsyncMock(return_value=stored)
+    mass_minimal.music.tracks.replace_metadata = AsyncMock()
     providers = {"spotify_1": first_provider, "spotify_2": second_provider}
     mass_minimal.music.get_visible_provider.side_effect = lambda provider, **_: providers.get(
         provider
@@ -585,6 +672,7 @@ async def test_library_music_sources_skip_hidden_unsupported_and_unavailable_map
     track.item_id, track.provider = "1", "library"
     mass_minimal.music = MagicMock()
     mass_minimal.music.tracks.get = AsyncMock(return_value=stored)
+    mass_minimal.music.tracks.replace_metadata = AsyncMock()
     mass_minimal.music.tracks.get_provider_item = AsyncMock()
     mass_minimal.music.get_visible_provider.side_effect = lambda provider, **_: {
         "unsupported_1": unsupported_provider,
@@ -618,6 +706,7 @@ async def test_library_mapped_source_failure_continues_to_metadata_provider(
     track.item_id, track.provider = "1", "library"
     mass_minimal.music = MagicMock()
     mass_minimal.music.tracks.get = AsyncMock(return_value=stored)
+    mass_minimal.music.tracks.replace_metadata = AsyncMock()
     mass_minimal.music.tracks.get_provider_item = AsyncMock(
         side_effect=RuntimeError("music source unavailable")
     )

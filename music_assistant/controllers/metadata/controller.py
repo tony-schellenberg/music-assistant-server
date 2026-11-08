@@ -479,9 +479,10 @@ class MetaDataController(
         Returns a tuple of (lyrics, lrc_lyrics) if found.
         """
         lyrics, lrc_lyrics = await self._get_track_lyrics(track)
-        # on-demand lookups are not stored in the library db, so normalize on the way out
-        # promoting LRC formatted text stored in the plain lyrics tag
-        return lyrics, normalize_lrc_lyrics(lrc_lyrics or extract_lrc_lyrics(lyrics))
+        # promote LRC formatted text stored in the plain lyrics tag
+        lrc_lyrics = normalize_lrc_lyrics(lrc_lyrics or extract_lrc_lyrics(lyrics))
+        await self._store_track_lyrics(track, lyrics, lrc_lyrics)
+        return lyrics, lrc_lyrics
 
     async def get_diagnostics(self) -> dict[str, SerializableType] | None:
         """Return diagnostics info for this controller to include in diagnostics reports."""
@@ -514,6 +515,26 @@ class MetaDataController(
                 return lyrics, None
             fallback_lyrics = fallback_lyrics or lyrics
         return fallback_lyrics, None
+
+    async def _store_track_lyrics(
+        self, track: Track, lyrics: str | None, lrc_lyrics: str | None
+    ) -> None:
+        """Store newly found lyrics for an accessible library track."""
+        if track.provider != "library" or not (lyrics or lrc_lyrics):
+            return
+        if (lyrics, lrc_lyrics) == (track.metadata.lyrics, track.metadata.lrc_lyrics):
+            return
+
+        # Resolve the canonical item as the caller before elevating the narrow metadata write.
+        library_track = await self.mass.music.tracks.get(
+            track.item_id, "library", allow_update_metadata=False
+        )
+        lyrics = lyrics or library_track.metadata.lyrics
+        lrc_lyrics = lrc_lyrics or library_track.metadata.lrc_lyrics
+        with system_auth_context():
+            await self.mass.music.tracks.replace_metadata(
+                track.item_id, {"lyrics": lyrics, "lrc_lyrics": lrc_lyrics}
+            )
 
     async def _iter_track_lyrics_metadata(
         self, track: Track
