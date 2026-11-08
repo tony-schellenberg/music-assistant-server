@@ -8,6 +8,7 @@ import random
 import sqlite3
 import threading
 from collections import OrderedDict
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from time import time
 from typing import TYPE_CHECKING, Any, cast
@@ -29,7 +30,7 @@ from music_assistant_models.enums import (
     SortField,
 )
 from music_assistant_models.errors import MediaNotFoundError, MusicAssistantError
-from music_assistant_models.media_items import Album, Artist, BrowseFolder, Track
+from music_assistant_models.media_items import Album, Artist, BrowseFolder, MediaItemMetadata, Track
 
 from music_assistant.constants import (
     CONF_LANGUAGE,
@@ -503,74 +504,91 @@ class MetaDataController(
         """Look up (lyrics, lrc_lyrics) for the given track."""
         prefer_synced = bool(self.config.get_value(CONF_PREFER_SYNCED_LYRICS, True))
         fallback_lyrics: str | None = None
-        has_track_lyrics = bool(
-            track.metadata and (track.metadata.lyrics or track.metadata.lrc_lyrics)
-        )
-        if has_track_lyrics:
-            lyrics = track.metadata.lyrics
-            lrc_lyrics = track.metadata.lrc_lyrics
-            if not prefer_synced or lrc_lyrics or extract_lrc_lyrics(lyrics):
-                return lyrics, lrc_lyrics
-            fallback_lyrics = lyrics
+        async for metadata in self._iter_track_lyrics_metadata(track):
+            lyrics, lrc_lyrics = _lyrics_from_metadata(metadata)
+            if not lyrics and not lrc_lyrics:
+                continue
+            if lrc_lyrics:
+                return lyrics or fallback_lyrics, lrc_lyrics
+            if not prefer_synced:
+                return lyrics, None
+            fallback_lyrics = fallback_lyrics or lyrics
+        return fallback_lyrics, None
 
+    async def _iter_track_lyrics_metadata(
+        self, track: Track
+    ) -> AsyncIterator[MediaItemMetadata | None]:
+        """Yield lyrics metadata from the track and its eligible providers in order."""
+        yield track.metadata
+        music_sources: list[tuple[MusicProvider, str]] = []
         if track.provider == "library":
-            if not has_track_lyrics:
-                # the stored item is refreshed, never the caller's copy of it; the refresh fills
-                # the household's library item from all its sources, so it runs as the server
-                track = await self.mass.music.tracks.get(
-                    track.item_id, "library", allow_update_metadata=False
-                )
-                with system_auth_context():
-                    await self._update_track_metadata(track, force_refresh=False)
-                lyrics = track.metadata.lyrics
-                lrc_lyrics = track.metadata.lrc_lyrics
-                if not prefer_synced or lrc_lyrics or extract_lrc_lyrics(lyrics):
-                    return lyrics, lrc_lyrics
-                fallback_lyrics = fallback_lyrics or lyrics
+            # Use the stored track and its mappings, but never refresh or mutate its metadata.
+            track = await self.mass.music.tracks.get(
+                track.item_id, "library", allow_update_metadata=False
+            )
+            yield track.metadata
+        if track.provider == "library" or not any(_lyrics_from_metadata(track.metadata)):
+            music_sources = self._get_music_lyrics_sources(track)
 
-        # prefer lyrics from the track's own provider
-        if not has_track_lyrics and track.provider != "library":
-            track_provider = self.mass.music.get_visible_provider(track.provider)
-            if (
-                isinstance(track_provider, MusicProvider)
-                and ProviderFeature.LYRICS in track_provider.supported_features
-            ):
-                full_track = await self.mass.music.tracks.get_provider_item(
-                    track.item_id, track.provider
+        for music_provider, item_id in music_sources:
+            try:
+                provider_track = await self.mass.music.tracks.get_provider_item(
+                    item_id, music_provider.instance_id, strict_provider_instance=True
                 )
-                if full_track.metadata and (
-                    full_track.metadata.lyrics or full_track.metadata.lrc_lyrics
-                ):
-                    lyrics = full_track.metadata.lyrics
-                    lrc_lyrics = full_track.metadata.lrc_lyrics
-                    if not prefer_synced or lrc_lyrics or extract_lrc_lyrics(lyrics):
-                        return lyrics, lrc_lyrics
-                    fallback_lyrics = lyrics
+            except Exception as err:
+                self._log_lyrics_provider_error(track, music_provider.name, err)
+                continue
+            yield provider_track.metadata
 
-        # fallback to other metadata providers
-        for provider in self.providers:
-            if ProviderFeature.LYRICS not in provider.supported_features:
+        for metadata_provider in self.providers:
+            if ProviderFeature.LYRICS not in metadata_provider.supported_features:
                 continue
             try:
-                metadata = await provider.get_track_metadata(track)
+                yield await metadata_provider.get_track_metadata(track)
             except Exception as err:
-                # a provider failure must not abort the lookup — skip to the next provider
-                self.logger.warning(
-                    "Error fetching lyrics for %s from provider %s: %s",
-                    track.name,
-                    provider.name,
-                    err,
-                    exc_info=err if self.logger.isEnabledFor(10) else None,
-                )
+                self._log_lyrics_provider_error(track, metadata_provider.name, err)
+
+    def _get_music_lyrics_sources(self, track: Track) -> list[tuple[MusicProvider, str]]:
+        """Return visible music providers that can supply this track's lyrics."""
+        if track.provider != "library":
+            provider = self.mass.music.get_visible_provider(track.provider)
+            if (
+                isinstance(provider, MusicProvider)
+                and ProviderFeature.LYRICS in provider.supported_features
+            ):
+                return [(provider, track.item_id)]
+            return []
+
+        sources: list[tuple[MusicProvider, str]] = []
+        seen_provider_keys: set[str] = set()
+        for mapping in sorted(
+            track.provider_mappings, key=lambda item: item.priority, reverse=True
+        ):
+            if not mapping.available:
                 continue
-            if metadata and (metadata.lyrics or metadata.lrc_lyrics):
-                if not prefer_synced:
-                    return metadata.lyrics, metadata.lrc_lyrics
-                lrc_lyrics = metadata.lrc_lyrics or extract_lrc_lyrics(metadata.lyrics)
-                if lrc_lyrics:
-                    return metadata.lyrics or fallback_lyrics, lrc_lyrics
-                fallback_lyrics = fallback_lyrics or metadata.lyrics
-        return fallback_lyrics, None
+            provider = self.mass.music.get_visible_provider(mapping.provider_instance, strict=True)
+            if not isinstance(provider, MusicProvider):
+                continue
+            if ProviderFeature.LYRICS not in provider.supported_features:
+                continue
+            provider_key = (
+                provider.domain if provider.is_streaming_provider else provider.instance_id
+            )
+            if provider_key in seen_provider_keys:
+                continue
+            seen_provider_keys.add(provider_key)
+            sources.append((provider, mapping.item_id))
+        return sources
+
+    def _log_lyrics_provider_error(self, track: Track, provider_name: str, err: Exception) -> None:
+        """Log a provider error encountered while looking up track lyrics."""
+        self.logger.warning(
+            "Error fetching lyrics for %s from provider %s: %s",
+            track.name,
+            provider_name,
+            err,
+            exc_info=err if self.logger.isEnabledFor(10) else None,
+        )
 
     def _register_maintenance_tasks(self) -> None:
         """Register the recurring metadata maintenance background tasks."""
@@ -1233,3 +1251,12 @@ def _valid_metadata_guard(table: str) -> str:
     # sqlite's json functions raise a fatal 'malformed JSON' error on invalid input,
     # which would fail the entire scan query because of a single corrupt row
     return f"({table}.metadata IS NULL OR json_valid({table}.metadata))"
+
+
+def _lyrics_from_metadata(
+    metadata: MediaItemMetadata | None,
+) -> tuple[str | None, str | None]:
+    """Return plain and synchronized lyrics from metadata."""
+    if metadata is None:
+        return None, None
+    return metadata.lyrics, metadata.lrc_lyrics or extract_lrc_lyrics(metadata.lyrics)

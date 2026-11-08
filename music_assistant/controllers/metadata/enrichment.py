@@ -658,10 +658,6 @@ class MetadataEnrichmentMixin:
                     if prefer_local_genres:
                         metadata = replace(metadata, genres=None)
                     sources.append((_metadata_source_rank(provider), metadata))
-                    if metadata.lrc_lyrics and not track.metadata.lrc_lyrics:
-                        track.metadata.lrc_lyrics = metadata.lrc_lyrics
-                        if track.metadata.lyrics:
-                            metadata = replace(metadata, lyrics=None)
                     track.metadata.update(_without_description(metadata))
                     self.logger.debug(
                         "Fetched metadata for Track %s on provider %s",

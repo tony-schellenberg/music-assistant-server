@@ -334,7 +334,9 @@ async def test_track_refresh_adds_synced_lyrics_without_replacing_source_lyrics(
     _mass(enrichment).music.tracks.get_provider_item = AsyncMock(return_value=source_track)
     _mass(enrichment).get_provider = MagicMock(return_value=MagicMock(is_streaming_provider=False))
     synced = "[00:12.00]Synchronized lyrics"
-    lyrics_provider = _lyrics_provider(MediaItemMetadata(lrc_lyrics=synced))
+    lyrics_provider = _lyrics_provider(
+        MediaItemMetadata(lyrics="Provider plain lyrics", lrc_lyrics=synced)
+    )
     enrichment.providers = [lyrics_provider]  # type: ignore[misc]
     track = _track_with_lyrics("stale", None, local)
 
