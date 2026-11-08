@@ -10,8 +10,9 @@ from music_assistant_models.auth import User, UserRole
 from music_assistant_models.config_entries import ProviderAccess
 from music_assistant_models.enums import ProviderFeature, ProviderSharing, ProviderType
 from music_assistant_models.errors import MediaNotFoundError
-from music_assistant_models.media_items import MediaItemPalette
+from music_assistant_models.media_items import MediaItemMetadata, MediaItemPalette
 
+from music_assistant.controllers.metadata.constants import CONF_PREFER_SYNCED_LYRICS
 from music_assistant.controllers.music import MusicController
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
     current_user,
@@ -212,3 +213,94 @@ async def test_lyrics_of_a_library_track_refresh_the_stored_item(
     # the refresh fills the household's item, so it runs as the server, not as the caller
     assert refreshing_users == [None]
     assert get_current_user() is None
+
+
+def _lyrics_metadata_provider(metadata: MediaItemMetadata | None) -> MagicMock:
+    """Return a lyrics metadata provider stub."""
+    provider = MagicMock()
+    provider.name = "LRCLIB"
+    provider.priority = 0
+    provider.supported_features = {ProviderFeature.LYRICS}
+    provider.get_track_metadata = AsyncMock(return_value=metadata)
+    return provider
+
+
+async def test_get_track_lyrics_prefers_synced_over_plain(
+    metadata_controller: MetaDataController, mass_minimal: MusicAssistant
+) -> None:
+    """Synced metadata-provider lyrics win over the track's plain lyrics."""
+    plain = "Plain source lyrics"
+    synced = "[00:12.00]Synchronized lyrics"
+    track = create_track("spotify_1", "track1")
+    track.metadata.lyrics = plain
+    provider = _lyrics_metadata_provider(MediaItemMetadata(lrc_lyrics=synced))
+
+    with patch.object(mass_minimal, "get_providers", return_value=[provider]):
+        assert await metadata_controller.get_track_lyrics(track) == (plain, synced)
+
+    provider.get_track_metadata.assert_awaited_once_with(track)
+
+
+@pytest.mark.parametrize("lookup", [None, RuntimeError("provider unavailable")])
+async def test_get_track_lyrics_falls_back_to_plain_when_synced_unavailable(
+    metadata_controller: MetaDataController,
+    mass_minimal: MusicAssistant,
+    lookup: MediaItemMetadata | Exception | None,
+) -> None:
+    """Missing or failing secondary lyrics providers preserve the source text."""
+    plain = "Plain source lyrics"
+    track = create_track("spotify_1", "track1")
+    track.metadata.lyrics = plain
+    provider = _lyrics_metadata_provider(None)
+    if isinstance(lookup, Exception):
+        provider.get_track_metadata = AsyncMock(side_effect=lookup)
+    else:
+        provider.get_track_metadata = AsyncMock(return_value=lookup)
+
+    with patch.object(mass_minimal, "get_providers", return_value=[provider]):
+        assert await metadata_controller.get_track_lyrics(track) == (plain, None)
+
+    provider.get_track_metadata.assert_awaited_once_with(track)
+
+
+async def test_get_track_lyrics_respects_prefer_synced_disabled(
+    metadata_controller: MetaDataController, mass_minimal: MusicAssistant
+) -> None:
+    """Disabling synced preference returns the first available lyrics without fallback."""
+    track = create_track("spotify_1", "track1")
+    track.metadata.lyrics = "Plain source lyrics"
+    provider = _lyrics_metadata_provider(MediaItemMetadata(lrc_lyrics="[00:12.00]Synced"))
+
+    with (
+        patch.object(metadata_controller.config, "get_value", return_value=False),
+        patch.object(mass_minimal, "get_providers", return_value=[provider]) as get_providers,
+    ):
+        assert await metadata_controller.get_track_lyrics(track) == ("Plain source lyrics", None)
+
+    get_providers.assert_not_called()
+    provider.get_track_metadata.assert_not_awaited()
+
+
+async def test_get_track_lyrics_returns_primary_synced_lyrics_immediately(
+    metadata_controller: MetaDataController, mass_minimal: MusicAssistant
+) -> None:
+    """Timed lyrics already on the track take precedence over other providers."""
+    synced = "[00:12.00]Synchronized lyrics"
+    track = create_track("spotify_1", "track1")
+    track.metadata.lyrics = synced
+    provider = _lyrics_metadata_provider(MediaItemMetadata(lrc_lyrics="[00:20.00]Other"))
+
+    with patch.object(mass_minimal, "get_providers", return_value=[provider]) as get_providers:
+        assert await metadata_controller.get_track_lyrics(track) == (synced, synced)
+
+    get_providers.assert_not_called()
+    provider.get_track_metadata.assert_not_awaited()
+
+
+async def test_prefer_synced_lyrics_config_defaults_to_enabled(
+    metadata_controller: MetaDataController,
+) -> None:
+    """The Metadata controller exposes the new preference enabled by default."""
+    entries = await metadata_controller.get_config_entries()
+    entry = next(entry for entry in entries if entry.key == CONF_PREFER_SYNCED_LYRICS)
+    assert entry.default_value is True

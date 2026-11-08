@@ -57,6 +57,7 @@ from music_assistant.providers.musicbrainz.provider import MusicbrainzProvider, 
 from .constants import (
     CONF_ENABLE_ONLINE_METADATA,
     CONF_PREFER_LOCAL_GENRES,
+    CONF_PREFER_SYNCED_LYRICS,
     REFRESH_INTERVAL,
     REFRESH_RETRY_INTERVAL,
 )
@@ -568,6 +569,7 @@ class MetadataEnrichmentMixin:
         self.logger.debug("Updating metadata for Track %s", track.name)
         sources: list[tuple[int, MediaItemMetadata]] = []
         source_missing = False
+        prefer_synced_lyrics = bool(self.config.get_value(CONF_PREFER_SYNCED_LYRICS, True))
 
         prev_lyrics = (track.metadata.lyrics, track.metadata.lrc_lyrics)
         if force_refresh:
@@ -623,6 +625,12 @@ class MetadataEnrichmentMixin:
             for provider in self.providers:
                 if ProviderFeature.TRACK_METADATA not in provider.supported_features:
                     continue
+                if (
+                    not prefer_synced_lyrics
+                    and ProviderFeature.LYRICS in provider.supported_features
+                    and (track.metadata.lyrics or track.metadata.lrc_lyrics)
+                ):
+                    continue
 
                 try:
                     # a forced refresh asks the provider again, rather than reading a cached result
@@ -650,6 +658,10 @@ class MetadataEnrichmentMixin:
                     if prefer_local_genres:
                         metadata = replace(metadata, genres=None)
                     sources.append((_metadata_source_rank(provider), metadata))
+                    if metadata.lrc_lyrics and not track.metadata.lrc_lyrics:
+                        track.metadata.lrc_lyrics = metadata.lrc_lyrics
+                        if track.metadata.lyrics:
+                            metadata = replace(metadata, lyrics=None)
                     track.metadata.update(_without_description(metadata))
                     self.logger.debug(
                         "Fetched metadata for Track %s on provider %s",

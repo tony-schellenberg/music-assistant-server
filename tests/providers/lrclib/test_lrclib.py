@@ -10,6 +10,7 @@ from music_assistant_models.errors import MusicAssistantError
 from music_assistant.helpers.throttle_retry import ThrottlerManager
 from music_assistant.providers.lrclib import SUPPORTED_FEATURES, LrclibProvider
 from tests.common import use_real_create_task
+from tests.controllers.music.helpers import create_track
 
 
 @pytest.fixture
@@ -49,6 +50,35 @@ async def test_get_data_returns_none_when_not_found(provider: LrclibProvider) ->
     )
 
     assert await provider._get_data(track_name="Song", artist_name="Artist") is None
+
+
+async def test_lookup_allowed_when_track_has_plain_lyrics(provider: LrclibProvider) -> None:
+    """Existing plain lyrics do not prevent LRCLIB from supplying synced lyrics."""
+    track = create_track("spotify_1", "track1")
+    track.metadata.lyrics = "Existing plain lyrics"
+    synced = "[00:12.00]Synchronized lyrics"
+    provider._get_data = AsyncMock(return_value={"syncedLyrics": synced})  # type: ignore[method-assign]
+
+    metadata = await provider.get_track_metadata(track)
+
+    assert metadata is not None
+    assert metadata.lyrics is None
+    assert metadata.lrc_lyrics == synced
+    provider._get_data.assert_awaited_once_with(
+        track_name=track.name,
+        artist_name=track.artists[0].name,
+        album_name="",
+        duration=track.duration,
+    )
+
+
+async def test_plain_lrclib_lyrics_do_not_replace_existing_lyrics(provider: LrclibProvider) -> None:
+    """An LRCLIB plain-lyrics result does not replace lyrics already on a track."""
+    track = create_track("spotify_1", "track1")
+    track.metadata.lyrics = "Existing plain lyrics"
+    provider._get_data = AsyncMock(return_value={"plainLyrics": "Different plain lyrics"})  # type: ignore[method-assign]
+
+    assert await provider.get_track_metadata(track) is None
 
 
 async def test_get_data_propagates_transient_error(provider: LrclibProvider) -> None:

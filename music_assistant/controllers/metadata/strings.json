@@ -16,6 +16,10 @@
       "label": "Use local genre metadata only when available",
       "description": "When enabled, online metadata providers will not add genres to items that already have a genre from a local source such as a file tag or NFO file. Items with no local genre still receive genres from online providers as usual."
     },
+    "prefer_synced_lyrics": {
+      "label": "Prefer synchronized lyrics",
+      "description": "When enabled, Music Assistant will look for synchronized lyrics from other metadata providers when the primary source only provides plain lyrics."
+    },
     "enable_radio_metadata_lookup": {
       "label": "Enable artist/track artwork lookup for radio streams",
       "description": "Look up artist and track artwork for radio streams from online sources when the station provides Artist - Track metadata.\n\nWhen disabled, radio streams show only the station logo (when available)."

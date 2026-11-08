@@ -36,6 +36,7 @@ from music_assistant_models.unique_list import UniqueList
 from music_assistant.constants import VARIOUS_ARTISTS_MBID
 from music_assistant.controllers.metadata.constants import (
     CONF_ENABLE_ONLINE_METADATA,
+    CONF_PREFER_SYNCED_LYRICS,
     REFRESH_INTERVAL,
     REFRESH_RETRY_INTERVAL,
 )
@@ -63,8 +64,8 @@ _REFRESHES = {
 
 
 def _online_metadata_only(key: str, *_args: Any, **_kwargs: Any) -> bool:
-    """Config stub: only online metadata is enabled (prefer-local-genres off)."""
-    return key == CONF_ENABLE_ONLINE_METADATA
+    """Config stub: online metadata and synced lyrics are enabled."""
+    return key in {CONF_ENABLE_ONLINE_METADATA, CONF_PREFER_SYNCED_LYRICS}
 
 
 def _metadata_provider(name: str, feature: ProviderFeature) -> MagicMock:
@@ -233,10 +234,13 @@ def _lyrics_provider(lyrics: MediaItemMetadata | Exception | None) -> MagicMock:
     if isinstance(lyrics, Exception):
         provider.get_track_metadata = AsyncMock(side_effect=lyrics)
     else:
-        # like LRCLIB, a track that already has lyrics is not looked up
+        # like LRCLIB, a plain result is ignored when the track already has lyrics
         provider.get_track_metadata = AsyncMock(
             side_effect=lambda track: (
-                None if track.metadata.lyrics or track.metadata.lrc_lyrics else lyrics
+                None
+                if track.metadata.lrc_lyrics
+                or (track.metadata.lyrics and not (lyrics and lyrics.lrc_lyrics))
+                else lyrics
             )
         )
     return provider
@@ -317,6 +321,45 @@ async def test_forced_track_refresh_takes_the_lyrics_of_the_local_file_first() -
     _replaced_lyrics(enrichment).assert_awaited_once_with(
         "1", {"lyrics": "local plain", "lrc_lyrics": None}
     )
+
+
+@pytest.mark.asyncio
+async def test_track_refresh_adds_synced_lyrics_without_replacing_source_lyrics() -> None:
+    """Synced metadata-provider lyrics augment rather than replace source plain lyrics."""
+    enrichment = _enrichment()
+    local = ProviderMapping(
+        item_id="local", provider_domain="filesystem_local", provider_instance="local_1"
+    )
+    source_track = _track_with_lyrics("source plain", None)
+    _mass(enrichment).music.tracks.get_provider_item = AsyncMock(return_value=source_track)
+    _mass(enrichment).get_provider = MagicMock(return_value=MagicMock(is_streaming_provider=False))
+    synced = "[00:12.00]Synchronized lyrics"
+    lyrics_provider = _lyrics_provider(MediaItemMetadata(lrc_lyrics=synced))
+    enrichment.providers = [lyrics_provider]  # type: ignore[misc]
+    track = _track_with_lyrics("stale", None, local)
+
+    await enrichment._update_track_metadata(track, force_refresh=True)
+
+    _replaced_lyrics(enrichment).assert_awaited_once_with(
+        "1", {"lyrics": "source plain", "lrc_lyrics": synced}
+    )
+    assert (track.metadata.lyrics, track.metadata.lrc_lyrics) == ("source plain", synced)
+
+
+@pytest.mark.asyncio
+async def test_track_enrichment_skips_synced_fallback_when_disabled() -> None:
+    """Disabling synced preference avoids background lyrics-provider lookups for plain lyrics."""
+    enrichment = _enrichment()
+    enrichment.config.get_value = lambda key, *_args, **_kwargs: (  # type: ignore[method-assign]
+        key == CONF_ENABLE_ONLINE_METADATA
+    )
+    lyrics_provider = _lyrics_provider(MediaItemMetadata(lrc_lyrics="[00:12.00]Synced"))
+    enrichment.providers = [lyrics_provider]  # type: ignore[misc]
+    track = _track_with_lyrics("source plain", None)
+
+    await enrichment._update_track_metadata(track, force_refresh=False)
+
+    lyrics_provider.get_track_metadata.assert_not_awaited()
 
 
 @pytest.mark.asyncio
