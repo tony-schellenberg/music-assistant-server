@@ -43,6 +43,7 @@ from music_assistant.controllers.metadata.constants import (
 from music_assistant.controllers.metadata.enrichment import MetadataEnrichmentMixin
 from music_assistant.controllers.music.helpers import fill_track_from_recording
 from music_assistant.controllers.music.listing_cache import Listing
+from music_assistant.models.music_provider import MusicProvider
 from music_assistant.providers.musicbrainz.models import (
     MusicBrainzArtist,
     MusicBrainzRecording,
@@ -243,6 +244,26 @@ def _lyrics_provider(lyrics: MediaItemMetadata | Exception | None) -> MagicMock:
     return provider
 
 
+def _filesystem_music_provider() -> MagicMock:
+    """Return a mock filesystem music provider."""
+    provider = MagicMock(spec=MusicProvider)
+    provider.domain = "filesystem_local"
+    provider.instance_id = "local_1"
+    provider.is_streaming_provider = False
+    return provider
+
+
+def _set_lyrics_config(
+    enrichment: MetadataEnrichmentMixin, *, prefer_synced: bool, online_metadata: bool
+) -> None:
+    """Configure the lyric-selection and online-metadata settings."""
+    values = {
+        CONF_ENABLE_ONLINE_METADATA: online_metadata,
+        CONF_PREFER_SYNCED_LYRICS: prefer_synced,
+    }
+    enrichment.config.get_value = lambda key, *_args, **_kwargs: values.get(key, False)
+
+
 def _track_with_lyrics(
     lyrics: str | None, lrc_lyrics: str | None, *mappings: ProviderMapping
 ) -> Track:
@@ -292,6 +313,51 @@ async def test_track_refresh_that_is_not_forced_keeps_the_stored_lyrics() -> Non
     _mass(enrichment).cache.handle_refresh.assert_called_once_with(False)
     _replaced_lyrics(enrichment).assert_not_awaited()
     assert (track.metadata.lyrics, track.metadata.lrc_lyrics) == ("stored", None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefer_synced", [False, True])
+@pytest.mark.parametrize(
+    ("stored_lyrics", "stored_lrc"),
+    [("stored plain", None), (None, "[00:01.00]stored synchronized")],
+)
+async def test_filesystem_lyrics_override_stored_lyrics(
+    prefer_synced: bool, stored_lyrics: str | None, stored_lrc: str | None
+) -> None:
+    """Filesystem lyrics take precedence over stored lyrics regardless of sync preference."""
+    enrichment = _enrichment()
+    _set_lyrics_config(enrichment, prefer_synced=prefer_synced, online_metadata=False)
+    local = ProviderMapping(
+        item_id="local", provider_domain="filesystem_local", provider_instance="local_1"
+    )
+    _mass(enrichment).get_provider = MagicMock(return_value=_filesystem_music_provider())
+    local_track = _track_with_lyrics("local plain", None)
+    local_track.provider = "local_1"
+    _mass(enrichment).music.tracks.get_provider_item = AsyncMock(return_value=local_track)
+    track = _track_with_lyrics(stored_lyrics, stored_lrc, local)
+
+    await enrichment._update_track_metadata(track)
+
+    assert (track.metadata.lyrics, track.metadata.lrc_lyrics) == ("local plain", None)
+
+
+@pytest.mark.asyncio
+async def test_empty_filesystem_lyrics_leave_stored_lyrics_available() -> None:
+    """An empty local result does not replace stored lyrics."""
+    enrichment = _enrichment()
+    _set_lyrics_config(enrichment, prefer_synced=False, online_metadata=False)
+    local = ProviderMapping(
+        item_id="local", provider_domain="filesystem_local", provider_instance="local_1"
+    )
+    _mass(enrichment).get_provider = MagicMock(return_value=_filesystem_music_provider())
+    local_track = _track_with_lyrics(None, None)
+    local_track.provider = "local_1"
+    _mass(enrichment).music.tracks.get_provider_item = AsyncMock(return_value=local_track)
+    track = _track_with_lyrics("stored plain", None, local)
+
+    await enrichment._update_track_metadata(track)
+
+    assert (track.metadata.lyrics, track.metadata.lrc_lyrics) == ("stored plain", None)
 
 
 @pytest.mark.asyncio
@@ -346,8 +412,15 @@ async def test_forced_track_refresh_takes_the_lyrics_of_the_local_file_first() -
         "local": _track_with_lyrics("local plain", None),
         "tidal": _track_with_lyrics("tidal plain", None),
     }
+    prov_items["local"].provider = "local_1"
+    prov_items["tidal"].provider = "t_1"
     _mass(enrichment).music.tracks.get_provider_item = AsyncMock(
         side_effect=lambda item_id, _instance, **_kwargs: prov_items[item_id]
+    )
+    _mass(enrichment).get_provider = MagicMock(
+        side_effect=lambda instance, **_kwargs: (
+            _filesystem_music_provider() if instance == "local_1" else MagicMock()
+        )
     )
     lyrics_provider = _lyrics_provider(MediaItemMetadata(lyrics="lrclib"))
     enrichment.providers = [lyrics_provider]  # type: ignore[misc]
@@ -358,6 +431,84 @@ async def test_forced_track_refresh_takes_the_lyrics_of_the_local_file_first() -
     _replaced_lyrics(enrichment).assert_awaited_once_with(
         "1", {"lyrics": "local plain", "lrc_lyrics": None}
     )
+
+
+@pytest.mark.asyncio
+async def test_library_fallback_from_filesystem_does_not_block_synced_music_lyrics() -> None:
+    """A library fallback is not authoritative and cannot block a later music source."""
+    enrichment = _enrichment()
+    _set_lyrics_config(enrichment, prefer_synced=True, online_metadata=False)
+    local = ProviderMapping(
+        item_id="local", provider_domain="filesystem_local", provider_instance="local_1"
+    )
+    remote = ProviderMapping(item_id="remote", provider_domain="tidal", provider_instance="tidal_1")
+    _mass(enrichment).get_provider = MagicMock(
+        side_effect=lambda instance, **_kwargs: (
+            _filesystem_music_provider() if instance == "local_1" else MagicMock()
+        )
+    )
+    fallback = _track_with_lyrics("stale library lyrics", None)
+    remote_track = _track_with_lyrics(None, "[00:01.00]remote synchronized")
+    remote_track.provider = "tidal_1"
+    _mass(enrichment).music.tracks.get_provider_item = AsyncMock(
+        side_effect=lambda item_id, _instance, **_kwargs: {
+            "local": fallback,
+            "remote": remote_track,
+        }[item_id]
+    )
+    track = _track_with_lyrics(None, None, local, remote)
+
+    await enrichment._update_track_metadata(track, force_refresh=True)
+
+    assert (track.metadata.lyrics, track.metadata.lrc_lyrics) == (
+        None,
+        "[00:01.00]remote synchronized",
+    )
+
+
+@pytest.mark.asyncio
+async def test_library_fallback_from_filesystem_does_not_block_synced_metadata_lyrics() -> None:
+    """A library fallback does not prevent metadata providers from finding synchronized lyrics."""
+    enrichment = _enrichment()
+    _set_lyrics_config(enrichment, prefer_synced=True, online_metadata=True)
+    local = ProviderMapping(
+        item_id="local", provider_domain="filesystem_local", provider_instance="local_1"
+    )
+    _mass(enrichment).get_provider = MagicMock(return_value=_filesystem_music_provider())
+    _mass(enrichment).music.tracks.get_provider_item = AsyncMock(
+        return_value=_track_with_lyrics("stale library lyrics", None)
+    )
+    metadata_provider = _lyrics_provider(MediaItemMetadata(lrc_lyrics="[00:01.00]metadata synced"))
+    enrichment.providers = [metadata_provider]  # type: ignore[misc]
+    track = _track_with_lyrics(None, None, local)
+
+    await enrichment._update_track_metadata(track, force_refresh=True)
+
+    metadata_provider.get_track_metadata.assert_awaited_once()
+    assert (track.metadata.lyrics, track.metadata.lrc_lyrics) == (
+        None,
+        "[00:01.00]metadata synced",
+    )
+
+
+@pytest.mark.asyncio
+async def test_filesystem_library_fallback_does_not_supply_lyrics_on_its_own() -> None:
+    """Lyrics on a library fallback are not treated as fresh filesystem lyrics."""
+    enrichment = _enrichment()
+    _set_lyrics_config(enrichment, prefer_synced=True, online_metadata=False)
+    local = ProviderMapping(
+        item_id="local", provider_domain="filesystem_local", provider_instance="local_1"
+    )
+    _mass(enrichment).get_provider = MagicMock(return_value=_filesystem_music_provider())
+    _mass(enrichment).music.tracks.get_provider_item = AsyncMock(
+        return_value=_track_with_lyrics("stale library lyrics", None)
+    )
+    track = _track_with_lyrics(None, None, local)
+
+    await enrichment._update_track_metadata(track, force_refresh=True)
+
+    assert (track.metadata.lyrics, track.metadata.lrc_lyrics) == (None, None)
+    _replaced_lyrics(enrichment).assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -380,7 +531,7 @@ async def test_local_file_plain_lyrics_override_remote_synchronized_lyrics(
     local = ProviderMapping(
         item_id="local", provider_domain="filesystem_local", provider_instance="local_1"
     )
-    local_provider = MagicMock()
+    local_provider = MagicMock(spec=MusicProvider)
     local_provider.domain = "filesystem_local"
     local_provider.instance_id = "local_1"
     local_provider.is_streaming_provider = False

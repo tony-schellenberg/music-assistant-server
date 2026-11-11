@@ -205,7 +205,12 @@ async def test_cached_plain_lyrics_lookup(
         track = create_track("spotify", "t1")
         track.item_id, track.provider = "1", "library"
 
+    requested_item_id, requested_provider = track.item_id, track.provider
+    original_metadata = track.metadata
+    original_lyrics = (original_metadata.lyrics, original_metadata.lrc_lyrics)
     result = await metadata_controller.get_track_lyrics(track)
+    assert track.metadata is original_metadata
+    assert (track.metadata.lyrics, track.metadata.lrc_lyrics) == original_lyrics
     if library and not online_metadata:
         assert result == ("cached plain", None)
         provider.get_track_metadata.assert_not_awaited()
@@ -216,7 +221,11 @@ async def test_cached_plain_lyrics_lookup(
     )
     provider.get_track_metadata.assert_awaited_once()
     lookup_track = provider.get_track_metadata.await_args.args[0]
-    assert lookup_track.metadata.lyrics is None
+    assert (lookup_track.item_id, lookup_track.provider) == (
+        requested_item_id,
+        requested_provider,
+    )
+    assert (lookup_track.metadata.lyrics, lookup_track.metadata.lrc_lyrics) == (None, None)
 
 
 async def test_remote_lyrics_lookup_keeps_first_plain_fallback(
@@ -251,6 +260,75 @@ async def test_remote_lyrics_lookup_keeps_first_plain_fallback(
     )
     first.get_track_metadata.assert_awaited_once()
     second.get_track_metadata.assert_awaited_once()
+
+
+async def test_remote_lyrics_lookup_continues_after_provider_failure(
+    metadata_controller: MetaDataController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing lyrics provider does not prevent lookup from later providers."""
+    failed = MagicMock()
+    failed.priority = 0
+    failed.supported_features = {ProviderFeature.LYRICS}
+    failed.name = "failed"
+    failed.get_track_metadata = AsyncMock(side_effect=RuntimeError("provider failed"))
+    succeeding = MagicMock()
+    succeeding.priority = 1
+    succeeding.supported_features = {ProviderFeature.LYRICS}
+    succeeding.is_local = False
+    succeeding.name = "succeeding"
+    succeeding.get_track_metadata = AsyncMock(
+        return_value=MediaItemMetadata(lrc_lyrics="[00:01.00]synchronized")
+    )
+    monkeypatch.setattr(
+        metadata_controller.mass,
+        "get_providers",
+        MagicMock(return_value=[failed, succeeding]),
+    )
+    metadata_controller.mass.music = MusicController(metadata_controller.mass)
+
+    assert await metadata_controller.get_track_lyrics(create_track("spotify", "t1")) == (
+        None,
+        "[00:01.00]synchronized",
+    )
+    failed.get_track_metadata.assert_awaited_once()
+    succeeding.get_track_metadata.assert_awaited_once()
+
+
+async def test_remote_lyrics_lookup_skips_unsupported_and_empty_sources(
+    metadata_controller: MetaDataController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unsupported sources and empty results do not stop the ordered lookup."""
+    unsupported = MagicMock()
+    unsupported.priority = 0
+    unsupported.supported_features = {ProviderFeature.TRACK_METADATA}
+    unsupported.get_track_metadata = AsyncMock()
+    empty = MagicMock()
+    empty.priority = 1
+    empty.supported_features = {ProviderFeature.LYRICS}
+    empty.name = "empty"
+    empty.get_track_metadata = AsyncMock(return_value=MediaItemMetadata())
+    succeeding = MagicMock()
+    succeeding.priority = 2
+    succeeding.supported_features = {ProviderFeature.LYRICS}
+    succeeding.is_local = False
+    succeeding.name = "succeeding"
+    succeeding.get_track_metadata = AsyncMock(
+        return_value=MediaItemMetadata(lrc_lyrics="[00:01.00]synchronized")
+    )
+    monkeypatch.setattr(
+        metadata_controller.mass,
+        "get_providers",
+        MagicMock(return_value=[unsupported, empty, succeeding]),
+    )
+    metadata_controller.mass.music = MusicController(metadata_controller.mass)
+
+    assert await metadata_controller.get_track_lyrics(create_track("spotify", "t1")) == (
+        None,
+        "[00:01.00]synchronized",
+    )
+    unsupported.get_track_metadata.assert_not_awaited()
+    empty.get_track_metadata.assert_awaited_once()
+    succeeding.get_track_metadata.assert_awaited_once()
 
 
 async def test_embedded_lrc_in_plain_lyrics_stops_remote_lookup(
