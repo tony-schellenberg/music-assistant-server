@@ -8,7 +8,7 @@ import random
 import sqlite3
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from time import time
 from typing import TYPE_CHECKING, Any, cast
 from uuid import NAMESPACE_URL, uuid5
@@ -60,6 +60,7 @@ from music_assistant.helpers.lyrics import extract_lrc_lyrics, normalize_lrc_lyr
 from music_assistant.helpers.throttle_retry import Throttler
 from music_assistant.helpers.util import try_parse_int
 from music_assistant.models.core_controller import CoreController
+from music_assistant.models.music_provider import MusicProvider
 
 from .constants import (
     ALBUM_RECONCILIATION_TASK_ID,
@@ -88,11 +89,6 @@ from .constants import (
 )
 from .enrichment import MetadataEnrichmentMixin
 from .images import ImageProxyMixin
-from .lyrics import (
-    LyricsSelector,
-    iter_music_lyrics_candidates,
-    track_without_deferred_lyrics,
-)
 from .radio import RadioArtworkMixin
 
 if TYPE_CHECKING:
@@ -100,7 +96,6 @@ if TYPE_CHECKING:
     from music_assistant_models.event import MassEvent
     from music_assistant_models.media_items import (
         Audiobook,
-        MediaItemMetadata,
         MediaItemType,
         Playlist,
         Podcast,
@@ -487,7 +482,20 @@ class MetaDataController(
 
         Returns a tuple of (lyrics, lrc_lyrics) if found.
         """
-        lyrics, lrc_lyrics = await self._get_track_lyrics(track)
+        prefer_synced = bool(self.config.get_value(CONF_PREFER_SYNCED_LYRICS, True))
+        track, lyrics, lrc_lyrics, local_override = await self._get_track_lyrics(track)
+        has_synced_lyrics = bool(lrc_lyrics or extract_lrc_lyrics(lyrics))
+        if not local_override and (
+            not (lyrics or lrc_lyrics) or (prefer_synced and not has_synced_lyrics)
+        ):
+            if track.provider != "library" or self.config.get_value(CONF_ENABLE_ONLINE_METADATA):
+                remote_lyrics = await self._search_remote_lyrics(track, prefer_synced)
+                if remote_lyrics and (
+                    not (lyrics or lrc_lyrics)
+                    or remote_lyrics[1]
+                    or extract_lrc_lyrics(remote_lyrics[0])
+                ):
+                    lyrics, lrc_lyrics = remote_lyrics
         # on-demand lookups are not stored in the library db, so normalize on the way out
         # promoting LRC formatted text stored in the plain lyrics tag
         return lyrics, normalize_lrc_lyrics(lrc_lyrics or extract_lrc_lyrics(lyrics))
@@ -509,65 +517,106 @@ class MetaDataController(
     async def _get_track_lyrics(
         self,
         track: Track,
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[Track, str | None, str | None, bool]:
         """Look up (lyrics, lrc_lyrics) for the given track."""
-        track = await self._prepare_track_for_lyrics_lookup(track)
-        selector = LyricsSelector(
-            prefer_synced=bool(self.config.get_value(CONF_PREFER_SYNCED_LYRICS, True))
-        )
-        async for metadata, authoritative in iter_music_lyrics_candidates(self.mass, track):
-            if selector.consider_metadata(metadata, authoritative=authoritative):
-                return selector.best_lyrics or (None, None)
-        if self._metadata_lyrics_lookup_allowed(track):
-            for provider in self.providers:
-                if ProviderFeature.LYRICS not in provider.supported_features:
-                    continue
-                provider_metadata = await self._get_metadata_provider_lyrics(
-                    provider, track, selector
-                )
-                if provider_metadata and selector.consider_metadata(
-                    provider_metadata, authoritative=provider.is_local
+        if track.provider == "library":
+            # the stored item is refreshed, never the caller's copy of it; the refresh fills
+            # the household's library item from all its sources, so it runs as the server
+            track = await self.mass.music.tracks.get(
+                track.item_id, "library", allow_update_metadata=False
+            )
+            with system_auth_context():
+                await self._update_track_metadata(track, force_refresh=False)
+
+            filesystem_lyrics: tuple[str | None, str | None] | None = None
+            for mapping in sorted(
+                track.provider_mappings, key=lambda mapping: mapping.priority, reverse=True
+            ):
+                provider = self.mass.music.get_visible_provider(mapping.provider_instance)
+                if not isinstance(provider, MusicProvider) or not provider.domain.startswith(
+                    "filesystem_"
                 ):
-                    return selector.best_lyrics or (None, None)
-        return selector.best_lyrics or (None, None)
+                    continue
+                full_track = await self.mass.music.tracks.get_provider_item(
+                    mapping.item_id, mapping.provider_instance
+                )
+                if full_track.provider != "library" and (
+                    full_track.metadata.lyrics or full_track.metadata.lrc_lyrics
+                ):
+                    candidate = (full_track.metadata.lyrics, full_track.metadata.lrc_lyrics)
+                    if candidate[1] or extract_lrc_lyrics(candidate[0]):
+                        return track, candidate[0], candidate[1], True
+                    if filesystem_lyrics is None:
+                        filesystem_lyrics = candidate
+            if filesystem_lyrics:
+                return track, filesystem_lyrics[0], filesystem_lyrics[1], True
+            if track.metadata.lyrics or track.metadata.lrc_lyrics:
+                return track, track.metadata.lyrics, track.metadata.lrc_lyrics, False
+            return track, None, None, False
 
-    async def _get_metadata_provider_lyrics(
-        self, provider: MetadataProvider, track: Track, selector: LyricsSelector
-    ) -> MediaItemMetadata | None:
-        """Fetch lyrics from a metadata provider, logging failures without ending lookup."""
-        try:
-            metadata = await provider.get_track_metadata(
-                track_without_deferred_lyrics(track, selector)
+        provider = self.mass.music.get_visible_provider(track.provider)
+        if isinstance(provider, MusicProvider) and provider.domain.startswith("filesystem_"):
+            full_track = await self.mass.music.tracks.get_provider_item(
+                track.item_id, track.provider
             )
-        except Exception as err:
-            self.logger.warning(
-                "Error fetching lyrics for %s from provider %s: %s",
-                track.name,
-                provider.name,
-                err,
-                exc_info=err if self.logger.isEnabledFor(10) else None,
+            if full_track.provider != "library" and (
+                full_track.metadata.lyrics or full_track.metadata.lrc_lyrics
+            ):
+                return (
+                    track,
+                    full_track.metadata.lyrics,
+                    full_track.metadata.lrc_lyrics,
+                    True,
+                )
+            if track.metadata.lyrics or track.metadata.lrc_lyrics:
+                return track, track.metadata.lyrics, track.metadata.lrc_lyrics, True
+
+        if track.metadata.lyrics or track.metadata.lrc_lyrics:
+            return track, track.metadata.lyrics, track.metadata.lrc_lyrics, False
+
+        if (
+            isinstance(provider, MusicProvider)
+            and ProviderFeature.LYRICS in provider.supported_features
+        ):
+            full_track = await self.mass.music.tracks.get_provider_item(
+                track.item_id, track.provider
             )
-            return None
-        return metadata
+            if full_track.metadata.lyrics or full_track.metadata.lrc_lyrics:
+                return track, full_track.metadata.lyrics, full_track.metadata.lrc_lyrics, False
+        return track, None, None, False
 
-    async def _prepare_track_for_lyrics_lookup(self, track: Track) -> Track:
-        """Refresh a library track before lookup when it has no stored lyrics."""
-        if track.provider != "library" or track.metadata.lyrics or track.metadata.lrc_lyrics:
-            return track
-        # the stored item is refreshed, never the caller's copy of it; the refresh fills
-        # the household's library item from all its sources, so it runs as the server
-        track = await self.mass.music.tracks.get(
-            track.item_id, "library", allow_update_metadata=False
+    async def _search_remote_lyrics(
+        self, track: Track, prefer_synced: bool
+    ) -> tuple[str | None, str | None] | None:
+        """Search metadata providers for lyrics, preferring synchronized results when requested."""
+        lookup_track = replace(
+            track,
+            metadata=replace(track.metadata, lyrics=None, lrc_lyrics=None),
         )
-        with system_auth_context():
-            await self._update_track_metadata(track, force_refresh=False)
-        return track
-
-    def _metadata_lyrics_lookup_allowed(self, track: Track) -> bool:
-        """Return whether metadata providers may be queried for this track."""
-        return track.provider != "library" or bool(
-            self.config.get_value(CONF_ENABLE_ONLINE_METADATA)
-        )
+        plain_fallback: tuple[str | None, str | None] | None = None
+        for provider in self.providers:
+            if ProviderFeature.LYRICS not in provider.supported_features:
+                continue
+            try:
+                metadata = await provider.get_track_metadata(lookup_track)
+            except Exception as err:
+                self.logger.warning(
+                    "Error fetching lyrics for %s from provider %s: %s",
+                    track.name,
+                    provider.name,
+                    err,
+                    exc_info=err if self.logger.isEnabledFor(10) else None,
+                )
+                continue
+            if not metadata or not (metadata.lyrics or metadata.lrc_lyrics):
+                continue
+            lyrics = (metadata.lyrics, metadata.lrc_lyrics)
+            has_synced_lyrics = bool(metadata.lrc_lyrics or extract_lrc_lyrics(metadata.lyrics))
+            if not prefer_synced or has_synced_lyrics:
+                return lyrics
+            if plain_fallback is None:
+                plain_fallback = lyrics
+        return plain_fallback
 
     def _register_maintenance_tasks(self) -> None:
         """Register the recurring metadata maintenance background tasks."""

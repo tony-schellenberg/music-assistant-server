@@ -267,6 +267,31 @@ async def test_remote_lyrics_lookup_keeps_first_plain_fallback(
         assert (lookup_track.metadata.lyrics, lookup_track.metadata.lrc_lyrics) == (None, None)
 
 
+async def test_synced_preference_continues_after_local_metadata_plain_lyrics(
+    metadata_controller: MetaDataController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The synced preference applies to metadata providers after filesystem overrides."""
+    _set_lyrics_config(metadata_controller, monkeypatch)
+    local_metadata = _lyrics_provider("local", MediaItemMetadata(lyrics="local provider plain"))
+    local_metadata.is_local = True
+    synced = _lyrics_provider(
+        "synced", MediaItemMetadata(lrc_lyrics="[00:01.00]synchronized"), priority=1
+    )
+    monkeypatch.setattr(
+        metadata_controller.mass,
+        "get_providers",
+        MagicMock(return_value=[local_metadata, synced]),
+    )
+    metadata_controller.mass.music = MusicController(metadata_controller.mass)
+
+    assert await metadata_controller.get_track_lyrics(create_track("spotify", "t1")) == (
+        None,
+        "[00:01.00]synchronized",
+    )
+    local_metadata.get_track_metadata.assert_awaited_once()
+    synced.get_track_metadata.assert_awaited_once()
+
+
 async def test_remote_lyrics_lookup_continues_after_provider_failure(
     metadata_controller: MetaDataController, monkeypatch: pytest.MonkeyPatch
 ) -> None:
