@@ -528,22 +528,9 @@ class MetaDataController(
             with system_auth_context():
                 await self._update_track_metadata(track, force_refresh=False)
 
-            for mapping in sorted(
-                track.provider_mappings, key=lambda mapping: mapping.priority, reverse=True
-            ):
-                provider = self.mass.music.get_visible_provider(mapping.provider_instance)
-                if not isinstance(provider, MusicProvider) or not provider.domain.startswith(
-                    "filesystem_"
-                ):
-                    continue
-                full_track = await self.mass.music.tracks.get_provider_item(
-                    mapping.item_id, mapping.provider_instance
-                )
-                if full_track.provider == "library" or not (
-                    full_track.metadata.lyrics or full_track.metadata.lrc_lyrics
-                ):
-                    continue
-                return track, full_track.metadata.lyrics, full_track.metadata.lrc_lyrics, True
+            local_lyrics = await self._get_local_track_lyrics(track)
+            if local_lyrics is not None:
+                return track, local_lyrics[0], local_lyrics[1], True
             return track, track.metadata.lyrics, track.metadata.lrc_lyrics, False
 
         provider = self.mass.music.get_visible_provider(track.provider)
@@ -574,6 +561,26 @@ class MetaDataController(
                 isinstance(provider, MusicProvider) and provider.domain.startswith("filesystem_"),
             )
         return track, None, None, False
+
+    async def _get_local_track_lyrics(self, track: Track) -> tuple[str | None, str | None] | None:
+        """Get lyrics from the first visible filesystem mapping, if available."""
+        for mapping in sorted(
+            track.provider_mappings, key=lambda mapping: mapping.priority, reverse=True
+        ):
+            provider = self.mass.music.get_visible_provider(mapping.provider_instance)
+            if not isinstance(provider, MusicProvider) or not provider.domain.startswith(
+                "filesystem_"
+            ):
+                continue
+            full_track = await self.mass.music.tracks.get_provider_item(
+                mapping.item_id, mapping.provider_instance
+            )
+            if full_track.provider == "library" or not (
+                full_track.metadata.lyrics or full_track.metadata.lrc_lyrics
+            ):
+                continue
+            return full_track.metadata.lyrics, full_track.metadata.lrc_lyrics
+        return None
 
     async def _search_remote_lyrics(
         self, track: Track, prefer_synced: bool
