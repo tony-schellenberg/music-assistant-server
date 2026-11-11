@@ -77,11 +77,11 @@ async def test_filesystem_lyrics_override_cached_lyrics(
     remote.get_track_metadata.assert_not_awaited()
 
 
-async def test_filesystem_sidecar_precedes_tags_from_other_mapping(
+async def test_first_filesystem_lyrics_stop_lookup(
     metadata_controller: MetaDataController,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An LRC sidecar from any local source takes precedence over plain local tags."""
+    """Plain local lyrics stop lookup without searching other mappings or remote sources."""
     mass = metadata_controller.mass
     mass.music = MusicController(mass)
     tags_provider = MagicMock(spec=MusicProvider)
@@ -115,16 +115,14 @@ async def test_filesystem_sidecar_precedes_tags_from_other_mapping(
     tags_track.metadata.lyrics = "local tags"
     sidecar_track = create_track("sidecar", "sidecar-track")
     sidecar_track.metadata.lrc_lyrics = "[00:01.00]local sidecar"
-    monkeypatch.setattr(
-        mass.music.tracks,
-        "get_provider_item",
-        AsyncMock(side_effect=[tags_track, sidecar_track]),
-    )
+    get_provider_item = AsyncMock(side_effect=[tags_track, sidecar_track])
+    monkeypatch.setattr(mass.music.tracks, "get_provider_item", get_provider_item)
+    search_remote_lyrics = AsyncMock()
+    monkeypatch.setattr(metadata_controller, "_search_remote_lyrics", search_remote_lyrics)
 
-    assert await metadata_controller.get_track_lyrics(track) == (
-        None,
-        "[00:01.00]local sidecar",
-    )
+    assert await metadata_controller.get_track_lyrics(track) == ("local tags", None)
+    assert get_provider_item.await_count == 1
+    search_remote_lyrics.assert_not_awaited()
 
 
 async def test_invisible_filesystem_mapping_is_not_used_for_lyrics(
@@ -152,3 +150,97 @@ async def test_invisible_filesystem_mapping_is_not_used_for_lyrics(
 
     assert await metadata_controller.get_track_lyrics(track) == (None, None)
     get_provider_item.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    (
+        "provider_domain",
+        "cached_lyrics",
+        "provider_item",
+        "item_lyrics",
+        "expected_lyrics",
+        "expected_local_override",
+        "expected_fetches",
+    ),
+    [
+        (
+            "filesystem_local",
+            None,
+            "local_1",
+            "file lyrics",
+            "file lyrics",
+            True,
+            1,
+        ),
+        (
+            "filesystem_local",
+            "cached lyrics",
+            "library",
+            "stale library lyrics",
+            "cached lyrics",
+            True,
+            1,
+        ),
+        (
+            "filesystem_local",
+            None,
+            "library",
+            "stale library lyrics",
+            None,
+            False,
+            1,
+        ),
+        (
+            "spotify",
+            None,
+            "spotify",
+            "provider lyrics",
+            "provider lyrics",
+            False,
+            1,
+        ),
+        (
+            "spotify",
+            "cached lyrics",
+            "spotify",
+            "ignored",
+            "cached lyrics",
+            False,
+            0,
+        ),
+        ("spotify", None, "spotify", None, None, False, 1),
+    ],
+)
+async def test_direct_provider_lyrics_lookup(
+    metadata_controller: MetaDataController,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_domain: str,
+    cached_lyrics: str | None,
+    provider_item: str,
+    item_lyrics: str | None,
+    expected_lyrics: str | None,
+    expected_local_override: bool,
+    expected_fetches: int,
+) -> None:
+    """Direct lookup fetches filesystem lyrics always and other providers on demand."""
+    mass = metadata_controller.mass
+    mass.music = MusicController(mass)
+    provider = MagicMock(spec=MusicProvider)
+    provider.domain = provider_domain
+    provider.supported_features = (
+        set() if provider_domain.startswith("filesystem_") else {ProviderFeature.LYRICS}
+    )
+    monkeypatch.setattr(mass.music, "get_visible_provider", MagicMock(return_value=provider))
+
+    provider_instance = "local_1" if provider_domain.startswith("filesystem_") else "spotify"
+    track = create_track(provider_instance, "t1")
+    track.metadata = MediaItemMetadata(lyrics=cached_lyrics)
+    full_track = create_track(provider_item, "t1")
+    full_track.metadata = MediaItemMetadata(lyrics=item_lyrics)
+    get_provider_item = AsyncMock(return_value=full_track)
+    monkeypatch.setattr(mass.music.tracks, "get_provider_item", get_provider_item)
+
+    result = await metadata_controller._get_track_lyrics(track)
+
+    assert result == (track, expected_lyrics, None, expected_local_override)
+    assert get_provider_item.await_count == expected_fetches

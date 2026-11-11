@@ -528,7 +528,6 @@ class MetaDataController(
             with system_auth_context():
                 await self._update_track_metadata(track, force_refresh=False)
 
-            filesystem_lyrics: tuple[str | None, str | None] | None = None
             for mapping in sorted(
                 track.provider_mappings, key=lambda mapping: mapping.priority, reverse=True
             ):
@@ -540,49 +539,40 @@ class MetaDataController(
                 full_track = await self.mass.music.tracks.get_provider_item(
                     mapping.item_id, mapping.provider_instance
                 )
-                if full_track.provider != "library" and (
+                if full_track.provider == "library" or not (
                     full_track.metadata.lyrics or full_track.metadata.lrc_lyrics
                 ):
-                    candidate = (full_track.metadata.lyrics, full_track.metadata.lrc_lyrics)
-                    if candidate[1] or extract_lrc_lyrics(candidate[0]):
-                        return track, candidate[0], candidate[1], True
-                    if filesystem_lyrics is None:
-                        filesystem_lyrics = candidate
-            if filesystem_lyrics:
-                return track, filesystem_lyrics[0], filesystem_lyrics[1], True
-            if track.metadata.lyrics or track.metadata.lrc_lyrics:
-                return track, track.metadata.lyrics, track.metadata.lrc_lyrics, False
-            return track, None, None, False
-
-        provider = self.mass.music.get_visible_provider(track.provider)
-        if isinstance(provider, MusicProvider) and provider.domain.startswith("filesystem_"):
-            full_track = await self.mass.music.tracks.get_provider_item(
-                track.item_id, track.provider
-            )
-            if full_track.provider != "library" and (
-                full_track.metadata.lyrics or full_track.metadata.lrc_lyrics
-            ):
-                return (
-                    track,
-                    full_track.metadata.lyrics,
-                    full_track.metadata.lrc_lyrics,
-                    True,
-                )
-            if track.metadata.lyrics or track.metadata.lrc_lyrics:
-                return track, track.metadata.lyrics, track.metadata.lrc_lyrics, True
-
-        if track.metadata.lyrics or track.metadata.lrc_lyrics:
+                    continue
+                return track, full_track.metadata.lyrics, full_track.metadata.lrc_lyrics, True
             return track, track.metadata.lyrics, track.metadata.lrc_lyrics, False
 
-        if (
-            isinstance(provider, MusicProvider)
-            and ProviderFeature.LYRICS in provider.supported_features
+        provider = self.mass.music.get_visible_provider(track.provider)
+        if isinstance(provider, MusicProvider) and (
+            provider.domain.startswith("filesystem_")
+            or (
+                not (track.metadata.lyrics or track.metadata.lrc_lyrics)
+                and ProviderFeature.LYRICS in provider.supported_features
+            )
         ):
             full_track = await self.mass.music.tracks.get_provider_item(
                 track.item_id, track.provider
             )
-            if full_track.metadata.lyrics or full_track.metadata.lrc_lyrics:
-                return track, full_track.metadata.lyrics, full_track.metadata.lrc_lyrics, False
+            if (
+                full_track.provider != "library" or not provider.domain.startswith("filesystem_")
+            ) and (full_track.metadata.lyrics or full_track.metadata.lrc_lyrics):
+                return (
+                    track,
+                    full_track.metadata.lyrics,
+                    full_track.metadata.lrc_lyrics,
+                    provider.domain.startswith("filesystem_"),
+                )
+        if track.metadata.lyrics or track.metadata.lrc_lyrics:
+            return (
+                track,
+                track.metadata.lyrics,
+                track.metadata.lrc_lyrics,
+                isinstance(provider, MusicProvider) and provider.domain.startswith("filesystem_"),
+            )
         return track, None, None, False
 
     async def _search_remote_lyrics(
