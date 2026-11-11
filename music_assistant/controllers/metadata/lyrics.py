@@ -19,7 +19,18 @@ if TYPE_CHECKING:
 
 
 class LyricsSelector:
-    """Prefer authoritative or synchronized lyrics, retaining plain lyrics as a fallback."""
+    """
+    Select lyrics from candidates supplied in precedence order.
+
+    Callers supply filesystem lyrics first, then stored lyrics, other music sources,
+    and finally metadata sources. Direct provider tracks use their cached lyrics
+    before freshly fetched lyrics from that provider.
+
+    With synchronized lyrics preferred, remote plain lyrics remain a fallback while
+    later sources are checked. Authoritative sources (filesystem music and local
+    metadata) can finalize plain lyrics, but never replace an already-final result.
+    Without that preference, the first nonempty candidate is final.
+    """
 
     def __init__(self, prefer_synced: bool) -> None:
         """Initialize selection with the remote-source synchronization preference."""
@@ -72,10 +83,18 @@ class LyricsSelector:
         self.consider(metadata.lyrics, metadata.lrc_lyrics, authoritative=authoritative)
         return self.is_final
 
-    def metadata_with_lyrics(
+    def apply_selected_lyrics(
         self, metadata: MediaItemMetadata, *, include_deferred: bool = False
     ) -> MediaItemMetadata:
-        """Return metadata with final lyrics, optionally including deferred plain lyrics."""
+        """
+        Return metadata with selected lyrics, leaving it unchanged if none qualify.
+
+        Unlike track_without_deferred_lyrics, this does not hide existing lyrics.
+
+        :param metadata: Metadata to copy when applying a selected result.
+        :param include_deferred: Allow the plain fallback when no final result exists.
+            If false, existing lyrics are still kept when no final result exists.
+        """
         lyrics = self.best_lyrics if include_deferred else self.final_lyrics
         if lyrics is None:
             return metadata

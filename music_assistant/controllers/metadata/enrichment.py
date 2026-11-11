@@ -588,6 +588,7 @@ class MetadataEnrichmentMixin:
         # note that we sort the providers by priority so that we always
         # prefer local providers over online providers
         unique_keys: set[str] = set()
+        filesystem_lyrics: list[MediaItemMetadata] = []
         other_music_lyrics: list[MediaItemMetadata] = []
         for prov_mapping in sorted(track.provider_mappings, key=lambda x: x.priority, reverse=True):
             prov = self.mass.get_provider(
@@ -612,32 +613,22 @@ class MetadataEnrichmentMixin:
                 if prov_item.provider != "library":
                     sources.append((_music_source_rank(prov), prov_item.metadata))
                     if is_filesystem_provider(prov):
-                        lyrics_selector.consider_metadata(prov_item.metadata, authoritative=True)
+                        filesystem_lyrics.append(prov_item.metadata)
                     else:
                         other_music_lyrics.append(prov_item.metadata)
-                track.metadata = lyrics_selector.metadata_with_lyrics(track.metadata)
-                track.metadata.update(
-                    replace(
-                        prov_item.metadata,
-                        description=None,
-                        description_language=None,
-                        lyrics=None,
-                        lrc_lyrics=None,
-                    )
-                )
+                track.metadata.update(_without_description_and_lyrics(prov_item.metadata))
                 # a provider's full track carries the ISRCs its album listing may leave out
                 for id_type, value in prov_item.external_ids:
                     if id_type == ExternalID.ISRC and is_valid_isrc(value):
                         track.add_external_id(ExternalID.ISRC, value)
 
+        for lyrics_metadata in filesystem_lyrics:
+            lyrics_selector.consider_metadata(lyrics_metadata, authoritative=True)
         if not force_refresh:
             lyrics_selector.consider(*prev_lyrics)
-        track.metadata = lyrics_selector.metadata_with_lyrics(
-            track.metadata, include_deferred=not force_refresh
-        )
-        for metadata in other_music_lyrics:
-            lyrics_selector.consider_metadata(metadata)
-            track.metadata = lyrics_selector.metadata_with_lyrics(track.metadata)
+        for lyrics_metadata in other_music_lyrics:
+            lyrics_selector.consider_metadata(lyrics_metadata)
+        track.metadata = lyrics_selector.apply_selected_lyrics(track.metadata)
 
         # identify the track on MusicBrainz before the metadata providers need its id
         retry_soon = await self._link_track_to_musicbrainz(track)
@@ -684,22 +675,16 @@ class MetadataEnrichmentMixin:
                         metadata = replace(metadata, genres=None)
                     sources.append((_metadata_source_rank(provider), metadata))
                     lyrics_selector.consider_metadata(metadata, authoritative=provider.is_local)
-                    track.metadata = lyrics_selector.metadata_with_lyrics(track.metadata)
-                    track.metadata.update(
-                        replace(
-                            metadata,
-                            description=None,
-                            description_language=None,
-                            lyrics=None,
-                            lrc_lyrics=None,
-                        )
-                    )
+                    track.metadata.update(_without_description_and_lyrics(metadata))
+                    track.metadata = lyrics_selector.apply_selected_lyrics(track.metadata)
                     self.logger.debug(
                         "Fetched metadata for Track %s on provider %s",
                         track.name,
                         provider.name,
                     )
-        track.metadata = lyrics_selector.metadata_with_lyrics(track.metadata, include_deferred=True)
+        track.metadata = lyrics_selector.apply_selected_lyrics(
+            track.metadata, include_deferred=True
+        )
         if force_refresh and not (track.metadata.lyrics or track.metadata.lrc_lyrics):
             # finding no lyrics says nothing about the stored ones, so they are kept
             track.metadata.lyrics, track.metadata.lrc_lyrics = prev_lyrics
@@ -1297,6 +1282,13 @@ def _metadata_source_rank(provider: MetadataProvider) -> int:
 def _without_description(metadata: MediaItemMetadata) -> MediaItemMetadata:
     """Return a copy of metadata without its description, which a refresh selects apart."""
     return replace(metadata, description=None, description_language=None)
+
+
+def _without_description_and_lyrics(metadata: MediaItemMetadata) -> MediaItemMetadata:
+    """Return metadata without fields that have separate selection policies."""
+    return replace(
+        metadata, description=None, description_language=None, lyrics=None, lrc_lyrics=None
+    )
 
 
 def _drop_provider_images(metadata: MediaItemMetadata, provider_instance_id: str) -> None:

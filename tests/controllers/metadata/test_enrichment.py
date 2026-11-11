@@ -261,7 +261,9 @@ def _set_lyrics_config(
         CONF_ENABLE_ONLINE_METADATA: online_metadata,
         CONF_PREFER_SYNCED_LYRICS: prefer_synced,
     }
-    enrichment.config.get_value = lambda key, *_args, **_kwargs: values.get(key, False)
+    cast("MagicMock", enrichment.config).get_value = lambda key, *_args, **_kwargs: values.get(
+        key, False
+    )
 
 
 def _track_with_lyrics(

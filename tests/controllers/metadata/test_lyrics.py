@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from music_assistant_models.enums import ProviderFeature
 from music_assistant_models.media_items import ProviderMapping
 from music_assistant_models.media_items.metadata import MediaItemMetadata
@@ -86,13 +87,13 @@ def test_lookup_track_hides_deferred_lyrics_without_mutating_original() -> None:
     assert (track.metadata.lyrics, track.metadata.lrc_lyrics) == ("plain lyrics", "original LRC")
 
 
-def test_metadata_with_lyrics_returns_a_new_metadata_object() -> None:
+def test_apply_selected_lyrics_returns_a_new_metadata_object() -> None:
     """Applying selected lyrics returns a copy and leaves the input unchanged."""
     metadata = MediaItemMetadata(lyrics="original lyrics", copyright="copyright")
     selector = LyricsSelector(prefer_synced=True)
     selector.consider_metadata(MediaItemMetadata(lrc_lyrics="[00:01.00]synchronized"))
 
-    updated = selector.metadata_with_lyrics(metadata)
+    updated = selector.apply_selected_lyrics(metadata)
 
     assert updated is not metadata
     assert updated.lyrics is None
@@ -102,17 +103,40 @@ def test_metadata_with_lyrics_returns_a_new_metadata_object() -> None:
     assert metadata.lrc_lyrics is None
 
 
-def test_metadata_with_lyrics_can_include_plain_fallback() -> None:
+def test_apply_selected_lyrics_can_include_plain_fallback() -> None:
     """Fallback lyrics are applied only when explicitly requested."""
     selector = LyricsSelector(prefer_synced=True)
     selector.consider_metadata(MediaItemMetadata(lyrics="plain fallback"))
     metadata = MediaItemMetadata(copyright="copyright")
 
-    assert selector.metadata_with_lyrics(metadata) is metadata
-    updated = selector.metadata_with_lyrics(metadata, include_deferred=True)
+    assert selector.apply_selected_lyrics(metadata) is metadata
+    updated = selector.apply_selected_lyrics(metadata, include_deferred=True)
 
     assert updated.lyrics == "plain fallback"
     assert updated.copyright == "copyright"
+
+
+@pytest.mark.parametrize("fallback", [None, "plain fallback"])
+def test_apply_selected_lyrics_keeps_existing_lyrics_without_a_final_result(
+    fallback: str | None,
+) -> None:
+    """Not applying deferred lyrics leaves existing lyrics intact, rather than hiding them."""
+    selector = LyricsSelector(prefer_synced=True)
+    selector.consider(fallback, None)
+    metadata = MediaItemMetadata(lyrics="existing lyrics")
+
+    assert selector.apply_selected_lyrics(metadata) is metadata
+    assert metadata.lyrics == "existing lyrics"
+
+
+def test_authoritative_lyrics_do_not_replace_a_final_result() -> None:
+    """Callers must supply authoritative sources before other final candidates."""
+    selector = LyricsSelector(prefer_synced=True)
+    selector.consider(None, "[00:01.00]first synchronized")
+
+    selector.consider("later local lyrics", None, authoritative=True)
+
+    assert selector.best_lyrics == (None, "[00:01.00]first synchronized")
 
 
 async def test_filesystem_lyrics_take_precedence_over_cached_library_lyrics() -> None:
