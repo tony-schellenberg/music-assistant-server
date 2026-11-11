@@ -712,6 +712,8 @@
   "core.metadata.config_entries.link_providers_via_musicbrainz.label": "Link items to your other music services through MusicBrainz",
   "core.metadata.config_entries.prefer_local_genres.description": "When enabled, online metadata providers will not add genres to items that already have a genre from a local source such as a file tag or NFO file. Items with no local genre still receive genres from online providers as usual.",
   "core.metadata.config_entries.prefer_local_genres.label": "Use local genre metadata only when available",
+  "core.metadata.config_entries.prefer_synced_lyrics.description": "When enabled, Music Assistant keeps checking remote lyric sources after finding plain lyrics and uses synchronized lyrics if available. Lyrics from local music files always take precedence.",
+  "core.metadata.config_entries.prefer_synced_lyrics.label": "Prefer synchronized lyrics from remote sources",
   "core.metadata.config_entries.thumb_cache_max_size.description": "Maximum total size in megabytes for the on-disk thumbnail cache.\n\nOldest thumbnails are automatically removed when this limit is exceeded.",
   "core.metadata.config_entries.thumb_cache_max_size.label": "Maximum thumbnail cache size (MB)",
   "core.metadata.manifest.description": "Configuration of the core metadata management module",

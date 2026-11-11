@@ -11,7 +11,12 @@ from music_assistant_models.config_entries import ProviderAccess
 from music_assistant_models.enums import ProviderFeature, ProviderSharing, ProviderType
 from music_assistant_models.errors import MediaNotFoundError
 from music_assistant_models.media_items import MediaItemPalette
+from music_assistant_models.media_items.metadata import MediaItemMetadata
 
+from music_assistant.controllers.metadata.constants import (
+    CONF_ENABLE_ONLINE_METADATA,
+    CONF_PREFER_SYNCED_LYRICS,
+)
 from music_assistant.controllers.music import MusicController
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
     current_user,
@@ -158,6 +163,168 @@ async def test_lyrics_come_only_from_a_source_the_user_may_see(
             ),
         ):
             assert (await metadata_controller.get_track_lyrics(track))[0] == lyrics
+
+
+@pytest.mark.parametrize("library", [False, True])
+@pytest.mark.parametrize("online_metadata", [False, True])
+async def test_cached_plain_lyrics_lookup(
+    metadata_controller: MetaDataController,
+    monkeypatch: pytest.MonkeyPatch,
+    library: bool,
+    online_metadata: bool,
+) -> None:
+    """Cached plain lyrics allow further lookup, respecting library online-metadata settings."""
+    monkeypatch.setattr(
+        metadata_controller.config,
+        "get_value",
+        lambda key, *_args, **_kwargs: (
+            key == CONF_PREFER_SYNCED_LYRICS
+            or (online_metadata and key == CONF_ENABLE_ONLINE_METADATA)
+        ),
+    )
+    provider = MagicMock()
+    provider.priority = 0
+    provider.supported_features = {ProviderFeature.LYRICS}
+    provider.is_local = False
+    provider.name = "lyrics"
+    provider.get_track_metadata = AsyncMock(
+        return_value=MediaItemMetadata(lrc_lyrics="[00:01.00]synchronized")
+    )
+    monkeypatch.setattr(
+        metadata_controller.mass, "get_providers", MagicMock(return_value=[provider])
+    )
+    metadata_controller.mass.music = MusicController(metadata_controller.mass)
+    track = create_track("spotify", "t1")
+    track.metadata.lyrics = "cached plain"
+    if library:
+        track.item_id, track.provider = "1", "library"
+        monkeypatch.setattr(
+            metadata_controller.mass.music.tracks, "get", AsyncMock(return_value=track)
+        )
+        monkeypatch.setattr(metadata_controller, "_update_track_metadata", AsyncMock())
+        track = create_track("spotify", "t1")
+        track.item_id, track.provider = "1", "library"
+
+    result = await metadata_controller.get_track_lyrics(track)
+    if library and not online_metadata:
+        assert result == ("cached plain", None)
+        provider.get_track_metadata.assert_not_awaited()
+        return
+    assert result == (
+        None,
+        "[00:01.00]synchronized",
+    )
+    provider.get_track_metadata.assert_awaited_once()
+    lookup_track = provider.get_track_metadata.await_args.args[0]
+    assert lookup_track.metadata.lyrics is None
+
+
+async def test_remote_lyrics_lookup_keeps_first_plain_fallback(
+    metadata_controller: MetaDataController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first plain result is returned if later remote sources have no synchronized lyrics."""
+    monkeypatch.setattr(
+        metadata_controller.config,
+        "get_value",
+        lambda key, *_args, **_kwargs: key == CONF_PREFER_SYNCED_LYRICS,
+    )
+    first = MagicMock()
+    first.priority = 0
+    first.supported_features = {ProviderFeature.LYRICS}
+    first.is_local = False
+    first.name = "first"
+    first.get_track_metadata = AsyncMock(return_value=MediaItemMetadata(lyrics="first plain"))
+    second = MagicMock()
+    second.priority = 1
+    second.supported_features = {ProviderFeature.LYRICS}
+    second.is_local = False
+    second.name = "second"
+    second.get_track_metadata = AsyncMock(return_value=MediaItemMetadata(lyrics="second plain"))
+    monkeypatch.setattr(
+        metadata_controller.mass, "get_providers", MagicMock(return_value=[first, second])
+    )
+    metadata_controller.mass.music = MusicController(metadata_controller.mass)
+
+    assert await metadata_controller.get_track_lyrics(create_track("spotify", "t1")) == (
+        "first plain",
+        None,
+    )
+    first.get_track_metadata.assert_awaited_once()
+    second.get_track_metadata.assert_awaited_once()
+
+
+async def test_embedded_lrc_in_plain_lyrics_stops_remote_lookup(
+    metadata_controller: MetaDataController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LRC-formatted text in the plain lyrics field counts as synchronized."""
+    monkeypatch.setattr(
+        metadata_controller.config,
+        "get_value",
+        lambda key, *_args, **_kwargs: key == CONF_PREFER_SYNCED_LYRICS,
+    )
+    first = MagicMock()
+    first.priority = 0
+    first.supported_features = {ProviderFeature.LYRICS}
+    first.is_local = False
+    first.name = "first"
+    first.get_track_metadata = AsyncMock(
+        return_value=MediaItemMetadata(lyrics="[00:01.00]embedded synchronized")
+    )
+    second = MagicMock()
+    second.priority = 1
+    second.supported_features = {ProviderFeature.LYRICS}
+    second.is_local = False
+    second.name = "second"
+    second.get_track_metadata = AsyncMock(
+        return_value=MediaItemMetadata(lrc_lyrics="[00:02.00]later synchronized")
+    )
+    monkeypatch.setattr(
+        metadata_controller.mass, "get_providers", MagicMock(return_value=[first, second])
+    )
+    metadata_controller.mass.music = MusicController(metadata_controller.mass)
+
+    assert await metadata_controller.get_track_lyrics(create_track("spotify", "t1")) == (
+        "[00:01.00]embedded synchronized",
+        "[00:01.00]embedded synchronized",
+    )
+    first.get_track_metadata.assert_awaited_once()
+    second.get_track_metadata.assert_not_awaited()
+
+
+async def test_remote_lyrics_lookup_can_stop_at_first_plain_result(
+    metadata_controller: MetaDataController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Disabling the preference returns the first plain result without further lookups."""
+    monkeypatch.setattr(
+        metadata_controller.config,
+        "get_value",
+        lambda key, *_args, **_kwargs: key != CONF_PREFER_SYNCED_LYRICS,
+    )
+    first = MagicMock()
+    first.priority = 0
+    first.supported_features = {ProviderFeature.LYRICS}
+    first.is_local = False
+    first.name = "first"
+    first.get_track_metadata = AsyncMock(return_value=MediaItemMetadata(lyrics="plain"))
+    second = MagicMock()
+    second.priority = 1
+    second.supported_features = {ProviderFeature.LYRICS}
+    second.is_local = False
+    second.name = "second"
+    second.get_track_metadata = AsyncMock(
+        return_value=MediaItemMetadata(lrc_lyrics="[00:01.00]synchronized")
+    )
+    monkeypatch.setattr(
+        metadata_controller.mass, "get_providers", MagicMock(return_value=[first, second])
+    )
+    metadata_controller.mass.music = MusicController(metadata_controller.mass)
+
+    assert await metadata_controller.get_track_lyrics(create_track("spotify", "t1")) == (
+        "plain",
+        None,
+    )
+    first.get_track_metadata.assert_awaited_once()
+    second.get_track_metadata.assert_not_awaited()
 
 
 async def test_lyrics_of_a_library_track_refresh_the_stored_item(

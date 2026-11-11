@@ -36,6 +36,7 @@ from music_assistant_models.unique_list import UniqueList
 from music_assistant.constants import VARIOUS_ARTISTS_MBID
 from music_assistant.controllers.metadata.constants import (
     CONF_ENABLE_ONLINE_METADATA,
+    CONF_PREFER_SYNCED_LYRICS,
     REFRESH_INTERVAL,
     REFRESH_RETRY_INTERVAL,
 )
@@ -294,6 +295,46 @@ async def test_track_refresh_that_is_not_forced_keeps_the_stored_lyrics() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("force_refresh", [False, True])
+async def test_track_refresh_searches_remote_sources_until_synced_lyrics(
+    force_refresh: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both due and forced refreshes can look beyond plain lyrics without changing write rules."""
+    enrichment = _enrichment()
+    monkeypatch.setattr(
+        enrichment.config,
+        "get_value",
+        lambda key, *_args, **_kwargs: (
+            key
+            in {
+                CONF_ENABLE_ONLINE_METADATA,
+                CONF_PREFER_SYNCED_LYRICS,
+            }
+        ),
+    )
+    first = _lyrics_provider(MediaItemMetadata(lyrics="first plain"))
+    second = _lyrics_provider(MediaItemMetadata(lrc_lyrics="[00:01.00]synchronized"))
+    enrichment.providers = [first, second]  # type: ignore[misc]
+    track = _track_with_lyrics("stored plain", None)
+
+    await enrichment._update_track_metadata(track, force_refresh=force_refresh)
+
+    first.get_track_metadata.assert_awaited_once()
+    second.get_track_metadata.assert_awaited_once()
+    assert (track.metadata.lyrics, track.metadata.lrc_lyrics) == (
+        None,
+        "[00:01.00]synchronized",
+    )
+    if force_refresh:
+        _replaced_lyrics(enrichment).assert_awaited_once_with(
+            "1", {"lyrics": None, "lrc_lyrics": "[00:01.00]synchronized"}
+        )
+    else:
+        _replaced_lyrics(enrichment).assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_forced_track_refresh_takes_the_lyrics_of_the_local_file_first() -> None:
     """The lyrics are read again from the music providers, a local file first."""
     enrichment = _enrichment()
@@ -314,6 +355,49 @@ async def test_forced_track_refresh_takes_the_lyrics_of_the_local_file_first() -
 
     await enrichment._update_track_metadata(track, force_refresh=True)
 
+    _replaced_lyrics(enrichment).assert_awaited_once_with(
+        "1", {"lyrics": "local plain", "lrc_lyrics": None}
+    )
+
+
+@pytest.mark.asyncio
+async def test_local_file_plain_lyrics_override_remote_synchronized_lyrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A remote provider cannot replace plain lyrics read from a local music file."""
+    enrichment = _enrichment()
+    monkeypatch.setattr(
+        enrichment.config,
+        "get_value",
+        lambda key, *_args, **_kwargs: (
+            key
+            in {
+                CONF_ENABLE_ONLINE_METADATA,
+                CONF_PREFER_SYNCED_LYRICS,
+            }
+        ),
+    )
+    local = ProviderMapping(
+        item_id="local", provider_domain="filesystem_local", provider_instance="local_1"
+    )
+    local_provider = MagicMock()
+    local_provider.domain = "filesystem_local"
+    local_provider.instance_id = "local_1"
+    local_provider.is_streaming_provider = False
+    _mass(enrichment).get_provider = MagicMock(return_value=local_provider)
+    local_track = _track_with_lyrics("local plain", None)
+    local_track.provider = "local_1"
+    _mass(enrichment).music.tracks.get_provider_item = AsyncMock(return_value=local_track)
+    lyrics_provider = _metadata_provider("lyrics", ProviderFeature.TRACK_METADATA)
+    lyrics_provider.get_track_metadata = AsyncMock(
+        return_value=MediaItemMetadata(lrc_lyrics="[00:01.00]remote synchronized")
+    )
+    enrichment.providers = [lyrics_provider]  # type: ignore[misc]
+    track = _track_with_lyrics("stored plain", None, local)
+
+    await enrichment._update_track_metadata(track, force_refresh=True)
+
+    lyrics_provider.get_track_metadata.assert_awaited_once()
     _replaced_lyrics(enrichment).assert_awaited_once_with(
         "1", {"lyrics": "local plain", "lrc_lyrics": None}
     )

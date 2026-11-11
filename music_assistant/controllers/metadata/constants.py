@@ -73,6 +73,8 @@ CONF_ENABLE_ONLINE_METADATA = "enable_online_metadata"
 
 CONF_PREFER_LOCAL_GENRES = "prefer_local_genres"
 
+CONF_PREFER_SYNCED_LYRICS = "prefer_synced_lyrics"
+
 CONF_ENABLE_RADIO_METADATA_LOOKUP = "enable_radio_metadata_lookup"
 
 CONF_LINK_PROVIDERS_VIA_MUSICBRAINZ = "link_providers_via_musicbrainz"

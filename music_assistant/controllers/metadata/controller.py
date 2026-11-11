@@ -60,7 +60,6 @@ from music_assistant.helpers.lyrics import extract_lrc_lyrics, normalize_lrc_lyr
 from music_assistant.helpers.throttle_retry import Throttler
 from music_assistant.helpers.util import try_parse_int
 from music_assistant.models.core_controller import CoreController
-from music_assistant.models.music_provider import MusicProvider
 
 from .constants import (
     ALBUM_RECONCILIATION_TASK_ID,
@@ -70,6 +69,7 @@ from .constants import (
     CONF_LINK_PROVIDERS_VIA_MUSICBRAINZ,
     CONF_MUSICBRAINZ_LINKED_DOMAINS,
     CONF_PREFER_LOCAL_GENRES,
+    CONF_PREFER_SYNCED_LYRICS,
     CONF_THUMB_CACHE_MAX_SIZE,
     DEFAULT_LANGUAGE,
     DEFAULT_THUMB_CACHE_MAX_SIZE_MB,
@@ -88,6 +88,7 @@ from .constants import (
 )
 from .enrichment import MetadataEnrichmentMixin
 from .images import ImageProxyMixin
+from .lyrics import LyricsSelector, iter_music_lyrics, track_without_lyrics
 from .radio import RadioArtworkMixin
 
 if TYPE_CHECKING:
@@ -201,6 +202,12 @@ class MetaDataController(
                 type=ConfigEntryType.BOOLEAN,
                 required=False,
                 default_value=False,
+            ),
+            ConfigEntry(
+                key=CONF_PREFER_SYNCED_LYRICS,
+                type=ConfigEntryType.BOOLEAN,
+                required=False,
+                default_value=True,
             ),
             ConfigEntry(
                 key=CONF_ENABLE_RADIO_METADATA_LOOKUP,
@@ -494,10 +501,7 @@ class MetaDataController(
         track: Track,
     ) -> tuple[str | None, str | None]:
         """Look up (lyrics, lrc_lyrics) for the given track."""
-        if track.metadata and track.metadata.lyrics:
-            return track.metadata.lyrics, track.metadata.lrc_lyrics
-
-        if track.provider == "library":
+        if track.provider == "library" and not (track.metadata.lyrics or track.metadata.lrc_lyrics):
             # the stored item is refreshed, never the caller's copy of it; the refresh fills
             # the household's library item from all its sources, so it runs as the server
             track = await self.mass.music.tracks.get(
@@ -505,26 +509,24 @@ class MetaDataController(
             )
             with system_auth_context():
                 await self._update_track_metadata(track, force_refresh=False)
-            return track.metadata.lyrics, track.metadata.lrc_lyrics
 
-        # prefer lyrics from the track's own provider
-        track_provider = self.mass.music.get_visible_provider(track.provider)
-        if (
-            isinstance(track_provider, MusicProvider)
-            and ProviderFeature.LYRICS in track_provider.supported_features
-        ):
-            full_track = await self.mass.music.tracks.get_provider_item(
-                track.item_id, track.provider
-            )
-            if full_track.metadata and full_track.metadata.lyrics:
-                return full_track.metadata.lyrics, full_track.metadata.lrc_lyrics
+        selector = LyricsSelector(bool(self.config.get_value(CONF_PREFER_SYNCED_LYRICS, True)))
+        async for source_metadata, authoritative in iter_music_lyrics(self.mass, track):
+            if selector.add(
+                source_metadata.lyrics, source_metadata.lrc_lyrics, authoritative=authoritative
+            ):
+                return selector.result or (None, None)
 
-        # fallback to other metadata providers
+        if track.provider == "library" and not self.config.get_value(CONF_ENABLE_ONLINE_METADATA):
+            return selector.result or (None, None)
+
+        # Metadata providers are ordered by their configured precedence.
         for provider in self.providers:
             if ProviderFeature.LYRICS not in provider.supported_features:
                 continue
             try:
-                metadata = await provider.get_track_metadata(track)
+                lookup_track = track_without_lyrics(track) if selector.should_continue else track
+                metadata = await provider.get_track_metadata(lookup_track)
             except Exception as err:
                 # a provider failure must not abort the lookup — skip to the next provider
                 self.logger.warning(
@@ -535,9 +537,13 @@ class MetaDataController(
                     exc_info=err if self.logger.isEnabledFor(10) else None,
                 )
                 continue
-            if metadata and (metadata.lyrics or metadata.lrc_lyrics):
-                return metadata.lyrics, metadata.lrc_lyrics
-        return None, None
+            if metadata and selector.add(
+                metadata.lyrics,
+                metadata.lrc_lyrics,
+                authoritative=provider.is_local,
+            ):
+                return selector.result or (None, None)
+        return selector.result or (None, None)
 
     def _register_maintenance_tasks(self) -> None:
         """Register the recurring metadata maintenance background tasks."""
