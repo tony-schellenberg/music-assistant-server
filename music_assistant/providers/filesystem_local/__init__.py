@@ -3133,18 +3133,28 @@ class LocalFileSystemProvider(MusicProvider):
         # the actual file location - just change the file extension
         assert file_item.ext is not None  # for type checking
         lrc_path = f"{file_item.relative_path.removesuffix(file_item.ext)}lrc"
+        sidecar_lyrics: str | None = None
         if await self._has_path(lrc_path):
             try:
                 raw = await self._read_file(lrc_path)
-                track.metadata.lrc_lyrics = raw.decode("utf-8")
+                sidecar_lyrics = raw.decode("utf-8-sig")
+                if not sidecar_lyrics.strip():
+                    sidecar_lyrics = None
             except Exception as err:
                 self.logger.warning(
                     "Failed to read lyrics file %s: %s",
                     lrc_path,
                     str(err),
                 )
+        if sidecar_lyrics:
+            if lrc_lyrics := lyrics.extract_lrc_lyrics(sidecar_lyrics):
+                track.metadata.lrc_lyrics = lrc_lyrics
+            else:
+                track.metadata.lyrics = sidecar_lyrics
         elif syn_lyrics := tags.synchronized_lyrics:
             track.metadata.lrc_lyrics = lyrics.convert_to_lrc_lyrics(syn_lyrics)
+        elif tags.lyrics:
+            track.metadata.lrc_lyrics = lyrics.extract_lrc_lyrics(tags.lyrics)
 
         return track
 

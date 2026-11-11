@@ -324,13 +324,17 @@ async def test_forced_track_refresh_takes_the_lyrics_of_the_local_file_first() -
 
 
 @pytest.mark.asyncio
-async def test_track_refresh_adds_synced_lyrics_without_replacing_source_lyrics() -> None:
-    """Synced metadata-provider lyrics augment rather than replace source plain lyrics."""
+@pytest.mark.parametrize("force_refresh", [True, False])
+async def test_track_refresh_keeps_local_lyrics_pair_over_online_synced_lyrics(
+    force_refresh: bool,
+) -> None:
+    """A local plain override replaces a stale pair and blocks online lyric augmentation."""
     enrichment = _enrichment()
     local = ProviderMapping(
         item_id="local", provider_domain="filesystem_local", provider_instance="local_1"
     )
     source_track = _track_with_lyrics("source plain", None)
+    source_track.provider = "local_1"
     _mass(enrichment).music.tracks.get_provider_item = AsyncMock(return_value=source_track)
     _mass(enrichment).get_provider = MagicMock(return_value=MagicMock(is_streaming_provider=False))
     synced = "[00:12.00]Synchronized lyrics"
@@ -338,14 +342,18 @@ async def test_track_refresh_adds_synced_lyrics_without_replacing_source_lyrics(
         MediaItemMetadata(lyrics="Provider plain lyrics", lrc_lyrics=synced)
     )
     enrichment.providers = [lyrics_provider]  # type: ignore[misc]
-    track = _track_with_lyrics("stale", None, local)
+    track = _track_with_lyrics("stale", "[00:02.00]stale", local)
 
-    await enrichment._update_track_metadata(track, force_refresh=True)
+    await enrichment._update_track_metadata(track, force_refresh=force_refresh)
 
     _replaced_lyrics(enrichment).assert_awaited_once_with(
-        "1", {"lyrics": "source plain", "lrc_lyrics": synced}
+        "1", {"lyrics": "source plain", "lrc_lyrics": None}
     )
-    assert (track.metadata.lyrics, track.metadata.lrc_lyrics) == ("source plain", synced)
+    assert (track.metadata.lyrics, track.metadata.lrc_lyrics) == ("source plain", None)
+    _mass(enrichment).music.tracks.get_provider_item.assert_awaited_once_with(
+        "local", "local_1", force_refresh=True
+    )
+    lyrics_provider.get_track_metadata.assert_not_awaited()
 
 
 @pytest.mark.asyncio

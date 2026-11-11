@@ -42,6 +42,7 @@ from music_assistant.constants import (
     DB_TABLE_PLAYLISTS,
     DB_TABLE_PROVIDER_MAPPINGS,
     DB_TABLE_TRACKS,
+    FILESYSTEM_PROVIDER_DOMAINS,
     VERBOSE_LOG_LEVEL,
 )
 from music_assistant.controllers.tasks.context import (
@@ -478,10 +479,10 @@ class MetaDataController(
 
         Returns a tuple of (lyrics, lrc_lyrics) if found.
         """
-        lyrics, lrc_lyrics = await self._get_track_lyrics(track)
+        lyrics, lrc_lyrics, local_override = await self._get_track_lyrics(track)
         # promote LRC formatted text stored in the plain lyrics tag
         lrc_lyrics = normalize_lrc_lyrics(lrc_lyrics or extract_lrc_lyrics(lyrics))
-        await self._store_track_lyrics(track, lyrics, lrc_lyrics)
+        await self._store_track_lyrics(track, lyrics, lrc_lyrics, replace_existing=local_override)
         return lyrics, lrc_lyrics
 
     async def get_diagnostics(self) -> dict[str, SerializableType] | None:
@@ -501,57 +502,104 @@ class MetaDataController(
     async def _get_track_lyrics(
         self,
         track: Track,
-    ) -> tuple[str | None, str | None]:
-        """Look up (lyrics, lrc_lyrics) for the given track."""
+    ) -> tuple[str | None, str | None, bool]:
+        """Return lyrics and whether they came from an authoritative local source."""
         prefer_synced = bool(self.config.get_value(CONF_PREFER_SYNCED_LYRICS, True))
+        source_track = track
+        if track.provider == "library":
+            source_track = await self.mass.music.tracks.get(
+                track.item_id, "library", allow_update_metadata=False
+            )
+        if local_lyrics := await self._get_local_track_lyrics(source_track):
+            return *local_lyrics, True
         fallback_lyrics: str | None = None
-        async for metadata in self._iter_track_lyrics_metadata(track):
+        async for metadata in self._iter_track_lyrics_metadata(track, source_track):
             lyrics, lrc_lyrics = _lyrics_from_metadata(metadata)
             if not lyrics and not lrc_lyrics:
                 continue
             if lrc_lyrics:
-                return lyrics or fallback_lyrics, lrc_lyrics
+                return lyrics or fallback_lyrics, lrc_lyrics, False
             if not prefer_synced:
-                return lyrics, None
+                return lyrics, None, False
             fallback_lyrics = fallback_lyrics or lyrics
-        return fallback_lyrics, None
+        return fallback_lyrics, None, False
+
+    async def _get_local_track_lyrics(self, track: Track) -> tuple[str | None, str | None] | None:
+        """Return fresh lyrics from the highest-priority visible filesystem source."""
+        if not any(
+            mapping.provider_domain in FILESYSTEM_PROVIDER_DOMAINS
+            for mapping in track.provider_mappings
+        ):
+            return None
+        for music_provider, item_id in self._get_music_lyrics_sources(track):
+            if music_provider.domain not in FILESYSTEM_PROVIDER_DOMAINS:
+                continue
+            try:
+                provider_track = await self.mass.music.tracks.get_provider_item(
+                    item_id,
+                    music_provider.instance_id,
+                    force_refresh=True,
+                    allow_fallback=False,
+                    strict_provider_instance=True,
+                )
+            except Exception as err:
+                self._log_lyrics_provider_error(track, music_provider.name, err)
+                continue
+            lyrics, lrc_lyrics = _lyrics_from_metadata(provider_track.metadata)
+            if lyrics or lrc_lyrics:
+                return lyrics, lrc_lyrics
+        return None
 
     async def _store_track_lyrics(
-        self, track: Track, lyrics: str | None, lrc_lyrics: str | None
+        self,
+        track: Track,
+        lyrics: str | None,
+        lrc_lyrics: str | None,
+        *,
+        replace_existing: bool = False,
     ) -> None:
         """Store newly found lyrics for an accessible library track."""
-        if track.provider != "library" or not (lyrics or lrc_lyrics):
+        if track.provider != "library" or not (lyrics or lrc_lyrics or replace_existing):
             return
-        if (lyrics, lrc_lyrics) == (track.metadata.lyrics, track.metadata.lrc_lyrics):
+        if not replace_existing and (lyrics, lrc_lyrics) == (
+            track.metadata.lyrics,
+            track.metadata.lrc_lyrics,
+        ):
             return
 
         # Resolve the canonical item as the caller before elevating the narrow metadata write.
         library_track = await self.mass.music.tracks.get(
             track.item_id, "library", allow_update_metadata=False
         )
-        lyrics = lyrics or library_track.metadata.lyrics
-        lrc_lyrics = lrc_lyrics or library_track.metadata.lrc_lyrics
+        if replace_existing and (lyrics, lrc_lyrics) == (
+            library_track.metadata.lyrics,
+            library_track.metadata.lrc_lyrics,
+        ):
+            return
+        if not replace_existing:
+            lyrics = lyrics or library_track.metadata.lyrics
+            lrc_lyrics = lrc_lyrics or library_track.metadata.lrc_lyrics
         with system_auth_context():
             await self.mass.music.tracks.replace_metadata(
                 track.item_id, {"lyrics": lyrics, "lrc_lyrics": lrc_lyrics}
             )
 
     async def _iter_track_lyrics_metadata(
-        self, track: Track
+        self, track: Track, source_track: Track
     ) -> AsyncIterator[MediaItemMetadata | None]:
         """Yield lyrics metadata from the track and its eligible providers in order."""
         yield track.metadata
         music_sources: list[tuple[MusicProvider, str]] = []
         if track.provider == "library":
             # Use the stored track and its mappings, but never refresh or mutate its metadata.
-            track = await self.mass.music.tracks.get(
-                track.item_id, "library", allow_update_metadata=False
-            )
+            track = source_track
             yield track.metadata
         if track.provider == "library" or not any(_lyrics_from_metadata(track.metadata)):
             music_sources = self._get_music_lyrics_sources(track)
 
         for music_provider, item_id in music_sources:
+            if music_provider.domain in FILESYSTEM_PROVIDER_DOMAINS:
+                continue
             try:
                 provider_track = await self.mass.music.tracks.get_provider_item(
                     item_id, music_provider.instance_id, strict_provider_instance=True

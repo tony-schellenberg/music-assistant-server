@@ -41,7 +41,11 @@ from music_assistant_models.media_items import (
 )
 from music_assistant_models.unique_list import UniqueList
 
-from music_assistant.constants import VARIOUS_ARTISTS_MBID, VARIOUS_ARTISTS_NAME
+from music_assistant.constants import (
+    FILESYSTEM_PROVIDER_DOMAINS,
+    VARIOUS_ARTISTS_MBID,
+    VARIOUS_ARTISTS_NAME,
+)
 from music_assistant.controllers.music.helpers import (
     discogs_external_id,
     fill_track_from_recording,
@@ -569,6 +573,7 @@ class MetadataEnrichmentMixin:
         self.logger.debug("Updating metadata for Track %s", track.name)
         sources: list[tuple[int, MediaItemMetadata]] = []
         source_missing = False
+        local_lyrics: tuple[str | None, str | None] | None = None
         prefer_synced_lyrics = bool(self.config.get_value(CONF_PREFER_SYNCED_LYRICS, True))
 
         prev_lyrics = (track.metadata.lyrics, track.metadata.lrc_lyrics)
@@ -598,16 +603,28 @@ class MetadataEnrichmentMixin:
                 prov_item = await self.mass.music.tracks.get_provider_item(
                     prov_mapping.item_id,
                     prov_mapping.provider_instance,
-                    force_refresh=force_refresh,
+                    force_refresh=(
+                        force_refresh or prov_mapping.provider_domain in FILESYSTEM_PROVIDER_DOMAINS
+                    ),
                 )
                 # a provider miss hands back the stored library item, which is not fresh
                 if prov_item.provider != "library":
                     sources.append((_music_source_rank(prov), prov_item.metadata))
+                if (
+                    prov_mapping.provider_domain in FILESYSTEM_PROVIDER_DOMAINS
+                    and prov_item.provider != "library"
+                    and local_lyrics is None
+                    and (prov_item.metadata.lyrics or prov_item.metadata.lrc_lyrics)
+                ):
+                    local_lyrics = (prov_item.metadata.lyrics, prov_item.metadata.lrc_lyrics)
                 track.metadata.update(_without_description(prov_item.metadata))
                 # a provider's full track carries the ISRCs its album listing may leave out
                 for id_type, value in prov_item.external_ids:
                     if id_type == ExternalID.ISRC and is_valid_isrc(value):
                         track.add_external_id(ExternalID.ISRC, value)
+
+        if local_lyrics is not None:
+            track.metadata.lyrics, track.metadata.lrc_lyrics = local_lyrics
 
         # identify the track on MusicBrainz before the metadata providers need its id
         retry_soon = await self._link_track_to_musicbrainz(track)
@@ -625,10 +642,12 @@ class MetadataEnrichmentMixin:
             for provider in self.providers:
                 if ProviderFeature.TRACK_METADATA not in provider.supported_features:
                     continue
-                if (
-                    not prefer_synced_lyrics
-                    and ProviderFeature.LYRICS in provider.supported_features
-                    and (track.metadata.lyrics or track.metadata.lrc_lyrics)
+                if ProviderFeature.LYRICS in provider.supported_features and (
+                    local_lyrics is not None
+                    or (
+                        not prefer_synced_lyrics
+                        and (track.metadata.lyrics or track.metadata.lrc_lyrics)
+                    )
                 ):
                     continue
 
@@ -664,7 +683,14 @@ class MetadataEnrichmentMixin:
                         track.name,
                         provider.name,
                     )
-        if force_refresh and not (track.metadata.lyrics or track.metadata.lrc_lyrics):
+        if local_lyrics is not None:
+            track.metadata.lyrics, track.metadata.lrc_lyrics = local_lyrics
+            if local_lyrics != prev_lyrics:
+                await self.mass.music.tracks.replace_metadata(
+                    track.item_id,
+                    {"lyrics": local_lyrics[0], "lrc_lyrics": local_lyrics[1]},
+                )
+        elif force_refresh and not (track.metadata.lyrics or track.metadata.lrc_lyrics):
             # finding no lyrics says nothing about the stored ones, so they are kept
             track.metadata.lyrics, track.metadata.lrc_lyrics = prev_lyrics
         elif force_refresh:

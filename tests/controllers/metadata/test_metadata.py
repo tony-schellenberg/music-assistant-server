@@ -10,7 +10,12 @@ from music_assistant_models.auth import User, UserRole
 from music_assistant_models.config_entries import ProviderAccess
 from music_assistant_models.enums import ProviderFeature, ProviderSharing, ProviderType
 from music_assistant_models.errors import MediaNotFoundError
-from music_assistant_models.media_items import MediaItemMetadata, MediaItemPalette, Track
+from music_assistant_models.media_items import (
+    MediaItemMetadata,
+    MediaItemPalette,
+    ProviderMapping,
+    Track,
+)
 
 from music_assistant.controllers.metadata.constants import CONF_PREFER_SYNCED_LYRICS
 from music_assistant.controllers.music import MusicController
@@ -177,32 +182,39 @@ async def test_lyrics_of_a_library_track_use_the_stored_item_without_refresh(
     mass_minimal.cache.get = AsyncMock(return_value=None)  # type: ignore[method-assign]
     mass_minimal.cache.set = AsyncMock()  # type: ignore[method-assign]
     await mass_minimal.music._setup_database()
-    set_music_source_access(
-        mass_minimal,
-        {"spotify_theirs": ProviderAccess(owner=owner.user_id, sharing=ProviderSharing.PRIVATE)},
-    )
-    with patch.object(mass_minimal, "metadata", MagicMock()):
-        stored = await mass_minimal.music.tracks.add_item_to_library(
-            create_track("spotify_theirs", "t1")
+    try:
+        set_music_source_access(
+            mass_minimal,
+            {
+                "spotify_theirs": ProviderAccess(
+                    owner=owner.user_id, sharing=ProviderSharing.PRIVATE
+                )
+            },
         )
-    metadata_controller._update_track_metadata = AsyncMock()  # type: ignore[method-assign]
-    crafted = create_track("spotify_theirs", "t1", name="Crafted")
-    crafted.item_id, crafted.provider = stored.item_id, "library"
+        with patch.object(mass_minimal, "metadata", MagicMock()):
+            stored = await mass_minimal.music.tracks.add_item_to_library(
+                create_track("spotify_theirs", "t1")
+            )
+        metadata_controller._update_track_metadata = AsyncMock()  # type: ignore[method-assign]
+        crafted = create_track("spotify_theirs", "t1", name="Crafted")
+        crafted.item_id, crafted.provider = stored.item_id, "library"
 
-    for user in (member, owner):
-        user_token = current_user.set(user)
-        try:
-            if user is member:
-                # the only source of the track is hidden from the member
-                with pytest.raises(MediaNotFoundError):
-                    await metadata_controller.get_track_lyrics(crafted)
-            else:
-                assert await metadata_controller.get_track_lyrics(crafted) == (None, None)
-            assert get_current_user() is user
-        finally:
-            current_user.reset(user_token)
-    metadata_controller._update_track_metadata.assert_not_awaited()
-    assert get_current_user() is None
+        for user in (member, owner):
+            user_token = current_user.set(user)
+            try:
+                if user is member:
+                    # the only source of the track is hidden from the member
+                    with pytest.raises(MediaNotFoundError):
+                        await metadata_controller.get_track_lyrics(crafted)
+                else:
+                    assert await metadata_controller.get_track_lyrics(crafted) == (None, None)
+                assert get_current_user() is user
+            finally:
+                current_user.reset(user_token)
+        metadata_controller._update_track_metadata.assert_not_awaited()
+        assert get_current_user() is None
+    finally:
+        await mass_minimal.music.database.close()
 
 
 def _lyrics_metadata_provider(metadata: MediaItemMetadata | None) -> MagicMock:
@@ -513,15 +525,15 @@ async def test_get_track_lyrics_does_not_clear_stored_lyrics(
     mass_minimal.music.tracks.replace_metadata.assert_not_awaited()
 
 
-async def test_cached_library_synced_lyrics_skip_stored_item_fetch(
+async def test_cached_library_synced_lyrics_check_stored_item_for_local_sources(
     metadata_controller: MetaDataController, mass_minimal: MusicAssistant
 ) -> None:
-    """Synchronized lyrics on the supplied library item stop lookup immediately."""
+    """Cached lyrics still require checking the canonical library mappings for overrides."""
     track = create_track("spotify_1", "track1")
     track.item_id, track.provider = "1", "library"
     track.metadata.lrc_lyrics = "[00:12.00]Cached library lyrics"
     mass_minimal.music = MagicMock()
-    mass_minimal.music.tracks.get = AsyncMock()
+    mass_minimal.music.tracks.get = AsyncMock(return_value=track)
     metadata_controller._update_track_metadata = AsyncMock()  # type: ignore[method-assign]
 
     with patch.object(mass_minimal, "get_providers", return_value=[]):
@@ -530,7 +542,9 @@ async def test_cached_library_synced_lyrics_skip_stored_item_fetch(
             "[00:12.00]Cached library lyrics",
         )
 
-    mass_minimal.music.tracks.get.assert_not_awaited()
+    mass_minimal.music.tracks.get.assert_awaited_once_with(
+        "1", "library", allow_update_metadata=False
+    )
     metadata_controller._update_track_metadata.assert_not_awaited()
 
 
@@ -556,6 +570,124 @@ async def test_stored_library_synced_lyrics_stop_before_provider_discovery(
     mass_minimal.music.tracks.replace_metadata.assert_awaited_once_with(
         "1", {"lyrics": None, "lrc_lyrics": synced}
     )
+
+
+@pytest.mark.parametrize("prefer_synced", [True, False])
+async def test_local_plain_lyrics_override_cached_synced_lyrics(
+    metadata_controller: MetaDataController,
+    mass_minimal: MusicAssistant,
+    prefer_synced: bool,
+) -> None:
+    """Fresh plain lyrics from a local file replace an older synchronized result."""
+    mapping = ProviderMapping(
+        item_id="local-track",
+        provider_domain="filesystem_local",
+        provider_instance="filesystem_local_1",
+    )
+    stored = create_track("spotify_1", "library-track")
+    stored.item_id, stored.provider = "1", "library"
+    stored.provider_mappings = {mapping}
+    stored.metadata.lrc_lyrics = "[00:02.00]Cached online lyrics"
+    track = create_track("spotify_1", "library-track")
+    track.item_id, track.provider = "1", "library"
+    track.provider_mappings = set()
+    track.metadata.lrc_lyrics = "[00:02.00]Cached online lyrics"
+    local_provider = _music_lyrics_provider("filesystem_local_1", "filesystem_local")
+    local_track = create_track("filesystem_local_1", "local-track")
+    local_track.metadata.lyrics = "Fresh local plain lyrics"
+    mass_minimal.music = MagicMock()
+    mass_minimal.music.tracks.get = AsyncMock(return_value=stored)
+    mass_minimal.music.tracks.get_provider_item = AsyncMock(return_value=local_track)
+    mass_minimal.music.tracks.replace_metadata = AsyncMock()
+    mass_minimal.music.get_visible_provider.return_value = local_provider
+    metadata_controller._update_track_metadata = AsyncMock()  # type: ignore[method-assign]
+
+    with (
+        patch.object(metadata_controller.config, "get_value", return_value=prefer_synced),
+        patch.object(mass_minimal, "get_providers", return_value=[]),
+    ):
+        assert await metadata_controller.get_track_lyrics(track) == (
+            "Fresh local plain lyrics",
+            None,
+        )
+
+    mass_minimal.music.tracks.get_provider_item.assert_awaited_once_with(
+        "local-track",
+        "filesystem_local_1",
+        force_refresh=True,
+        allow_fallback=False,
+        strict_provider_instance=True,
+    )
+    mass_minimal.music.tracks.replace_metadata.assert_awaited_once_with(
+        "1", {"lyrics": "Fresh local plain lyrics", "lrc_lyrics": None}
+    )
+
+
+@pytest.mark.parametrize("provider_visible", [True, False])
+async def test_unavailable_local_provider_does_not_replace_stored_lyrics(
+    metadata_controller: MetaDataController,
+    mass_minimal: MusicAssistant,
+    provider_visible: bool,
+) -> None:
+    """An inaccessible local source cannot clear the lyrics already stored in the library."""
+    mapping = ProviderMapping(
+        item_id="local-track",
+        provider_domain="filesystem_local",
+        provider_instance="filesystem_local_1",
+    )
+    synced = "[00:02.00]Stored lyrics"
+    stored = create_track("spotify_1", "library-track")
+    stored.item_id, stored.provider = "1", "library"
+    stored.provider_mappings = {mapping}
+    stored.metadata.lrc_lyrics = synced
+    track = create_track("spotify_1", "library-track")
+    track.item_id, track.provider = "1", "library"
+    track.provider_mappings = {mapping}
+    track.metadata.lrc_lyrics = synced
+    mass_minimal.music = MagicMock()
+    mass_minimal.music.tracks.get = AsyncMock(return_value=stored)
+    mass_minimal.music.tracks.get_provider_item = AsyncMock(
+        side_effect=MediaNotFoundError("Local file unavailable")
+    )
+    mass_minimal.music.tracks.replace_metadata = AsyncMock()
+    mass_minimal.music.get_visible_provider.return_value = (
+        _music_lyrics_provider("filesystem_local_1", "filesystem_local")
+        if provider_visible
+        else None
+    )
+
+    assert await metadata_controller.get_track_lyrics(track) == (None, synced)
+
+    assert mass_minimal.music.tracks.get_provider_item.await_count == int(provider_visible)
+    mass_minimal.music.tracks.replace_metadata.assert_not_awaited()
+
+
+async def test_direct_local_plain_lyrics_stop_online_lookup(
+    metadata_controller: MetaDataController, mass_minimal: MusicAssistant
+) -> None:
+    """Plain local overrides also apply to tracks that are not in the library."""
+    track = create_track("filesystem_local_1", "local-track")
+    track.provider_mappings = {
+        ProviderMapping(
+            item_id="local-track",
+            provider_domain="filesystem_local",
+            provider_instance="filesystem_local_1",
+        )
+    }
+    track.metadata.lyrics = "Local plain lyrics"
+    online_provider = _lyrics_metadata_provider(
+        MediaItemMetadata(lrc_lyrics="[00:02.00]Online synchronized lyrics")
+    )
+    mass_minimal.music = MagicMock()
+    mass_minimal.music.get_visible_provider.return_value = _music_lyrics_provider(
+        "filesystem_local_1", "filesystem_local"
+    )
+    mass_minimal.music.tracks.get_provider_item = AsyncMock(return_value=track)
+
+    with patch.object(mass_minimal, "get_providers", return_value=[online_provider]):
+        assert await metadata_controller.get_track_lyrics(track) == ("Local plain lyrics", None)
+
+    online_provider.get_track_metadata.assert_not_awaited()
 
 
 async def test_library_music_sources_follow_mapping_priority_and_stop_on_synced_lyrics(
