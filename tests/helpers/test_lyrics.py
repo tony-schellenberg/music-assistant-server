@@ -1,8 +1,11 @@
 """Tests for the lyrics helpers."""
 
+import pytest
+
 from music_assistant.helpers.lyrics import (
     convert_to_lrc_lyrics,
     extract_lrc_lyrics,
+    get_lrc_lyrics,
     normalize_lrc_lyrics,
 )
 
@@ -23,6 +26,22 @@ LRC_WITH_ID_TAGS = """[ar:Chubby Checker oppure  Beatles, The]
 
 LRC_CLEAN = """[00:12.00]Naku Penda Piya-Naku Taka Piya-Mpenziwe
 [00:15.30]Some more lyrics ..."""
+
+
+@pytest.mark.parametrize(
+    ("lyrics", "lrc_lyrics", "expected"),
+    [
+        (None, None, None),
+        ("", "", None),
+        ("plain lyrics", None, None),
+        ("[00:01.00]timed lyrics", None, "[00:01.00]timed lyrics"),
+        ("[00:01.00]timed lyrics", "untimed explicit lyrics", "untimed explicit lyrics"),
+        ("[00:01.00]timed lyrics", "", "[00:01.00]timed lyrics"),
+    ],
+)
+def test_get_lrc_lyrics(lyrics: str | None, lrc_lyrics: str | None, expected: str | None) -> None:
+    """Test explicit synchronized lyrics take precedence over detected LRC text."""
+    assert get_lrc_lyrics(lyrics, lrc_lyrics) == expected
 
 
 def test_normalize_strips_id_tags() -> None:

@@ -3279,7 +3279,10 @@ class LocalFileSystemProvider(MusicProvider):
         if await self._has_path(lrc_path):
             try:
                 raw = await self._read_file(lrc_path)
-                track.metadata.lrc_lyrics = raw.decode("utf-8")
+                sidecar_lyrics = raw.decode("utf-8")
+                track.metadata.lrc_lyrics = lyrics.extract_lrc_lyrics(sidecar_lyrics)
+                if not track.metadata.lrc_lyrics:
+                    track.metadata.lyrics = sidecar_lyrics
             except Exception as err:
                 self.logger.warning(
                     "Failed to read lyrics file %s: %s",

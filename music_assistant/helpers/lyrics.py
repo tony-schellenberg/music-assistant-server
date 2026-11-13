@@ -65,6 +65,16 @@ def extract_lrc_lyrics(lyrics: str | None) -> str | None:
     return lyrics
 
 
+def get_lrc_lyrics(lyrics: str | None, lrc_lyrics: str | None) -> str | None:
+    """
+    Return synchronized lyrics from the explicit field or the plain lyrics field.
+
+    :param lyrics: The plain lyrics text to inspect.
+    :param lrc_lyrics: The explicit synchronized lyrics.
+    """
+    return lrc_lyrics or extract_lrc_lyrics(lyrics)
+
+
 def _expand_line(line: str) -> list[tuple[float | None, str]]:
     """Expand a lyric line into (time, line) entries, one per leading timestamp."""
     block_match = _LRC_TIMESTAMP_BLOCK_RE.match(line)

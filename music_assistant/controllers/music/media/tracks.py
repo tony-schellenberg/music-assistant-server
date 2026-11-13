@@ -69,7 +69,7 @@ from music_assistant.helpers.compare import (
 from music_assistant.helpers.database import UNSET
 from music_assistant.helpers.external_ids import is_valid_isrc, normalize_external_id
 from music_assistant.helpers.json import json_loads, serialize_to_json
-from music_assistant.helpers.lyrics import extract_lrc_lyrics, normalize_lrc_lyrics
+from music_assistant.helpers.lyrics import get_lrc_lyrics, normalize_lrc_lyrics
 from music_assistant.helpers.provider_access import visible_items
 from music_assistant.models.music_provider import MusicProvider
 
@@ -1640,7 +1640,7 @@ class TracksController(MediaControllerBase[Track]):
         # normalize synced lyrics so clients only need a minimal single-timestamp LRC parser
         # promoting LRC formatted text stored in the plain lyrics tag
         item.metadata.lrc_lyrics = normalize_lrc_lyrics(
-            item.metadata.lrc_lyrics or extract_lrc_lyrics(item.metadata.lyrics)
+            get_lrc_lyrics(item.metadata.lyrics, item.metadata.lrc_lyrics)
         )
         db_id = await self.mass.music.database.insert(
             self.db_table,
@@ -1685,7 +1685,7 @@ class TracksController(MediaControllerBase[Track]):
         cur_item = await self.get_library_item(db_id)
         metadata = update.metadata if overwrite else cur_item.metadata.update(update.metadata)
         metadata.lrc_lyrics = normalize_lrc_lyrics(
-            metadata.lrc_lyrics or extract_lrc_lyrics(metadata.lyrics)
+            get_lrc_lyrics(metadata.lyrics, metadata.lrc_lyrics)
         )
         cur_item.external_ids.update(update.external_ids)
         name = update.name if overwrite else cur_item.name
