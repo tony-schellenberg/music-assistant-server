@@ -497,6 +497,13 @@ class MetaDataController(
             )
         return diagnostics
 
+    @staticmethod
+    def _get_lyrics_tuple(track: Track) -> tuple[str | None, str | None]:
+        """Return the track's lyrics fields as a tuple."""
+        if track.metadata:
+            return track.metadata.lyrics, track.metadata.lrc_lyrics
+        return None, None
+
     async def _get_track_lyrics(
         self,
         track: Track,
@@ -507,14 +514,7 @@ class MetaDataController(
             return local_lyrics
 
         prefer_synced = bool(self.config.get_value(CONF_PREFER_SYNCED_LYRICS))
-        initial_lyrics = (
-            (
-                track.metadata.lyrics,
-                track.metadata.lrc_lyrics,
-            )
-            if track.metadata
-            else (None, None)
-        )
+        initial_lyrics = self._get_lyrics_tuple(track)
         if not any(initial_lyrics):
             if track.provider == "library":
                 track, initial_lyrics = await self._get_library_track_lyrics(track)
@@ -555,10 +555,9 @@ class MetaDataController(
                     err,
                 )
                 continue
-            if provider_track.metadata and (
-                provider_track.metadata.lyrics or provider_track.metadata.lrc_lyrics
-            ):
-                return provider_track.metadata.lyrics, provider_track.metadata.lrc_lyrics
+            lyrics = self._get_lyrics_tuple(provider_track)
+            if any(lyrics):
+                return lyrics
         return None
 
     async def _get_library_track_lyrics(
@@ -571,14 +570,7 @@ class MetaDataController(
         )
         with system_auth_context():
             await self._update_track_metadata(track, force_refresh=False)
-        lyrics = (
-            (
-                track.metadata.lyrics,
-                track.metadata.lrc_lyrics,
-            )
-            if track.metadata
-            else (None, None)
-        )
+        lyrics = self._get_lyrics_tuple(track)
         return track, lyrics
 
     async def _get_track_provider_lyrics(
@@ -591,14 +583,7 @@ class MetaDataController(
             and ProviderFeature.LYRICS in provider.supported_features
         ):
             track = await self.mass.music.tracks.get_provider_item(track.item_id, track.provider)
-        lyrics = (
-            (
-                track.metadata.lyrics,
-                track.metadata.lrc_lyrics,
-            )
-            if track.metadata
-            else (None, None)
-        )
+        lyrics = self._get_lyrics_tuple(track)
         return track, lyrics
 
     async def _search_metadata_provider_lyrics(
