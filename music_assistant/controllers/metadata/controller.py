@@ -57,7 +57,7 @@ from music_assistant.helpers.compare import (
     album_retail_suffix_sql_match,
 )
 from music_assistant.helpers.images import cleanup_thumb_cache
-from music_assistant.helpers.lyrics import extract_lrc_lyrics, normalize_lrc_lyrics
+from music_assistant.helpers.lyrics import get_lrc_lyrics, normalize_lrc_lyrics
 from music_assistant.helpers.throttle_retry import Throttler
 from music_assistant.helpers.util import try_parse_int
 from music_assistant.models.core_controller import CoreController
@@ -481,7 +481,7 @@ class MetaDataController(
         lyrics, lrc_lyrics = await self._get_track_lyrics(track)
         # on-demand lookups are not stored in the library db, so normalize on the way out
         # promoting LRC formatted text stored in the plain lyrics tag
-        return lyrics, normalize_lrc_lyrics(lrc_lyrics or extract_lrc_lyrics(lyrics))
+        return lyrics, normalize_lrc_lyrics(get_lrc_lyrics(lyrics, lrc_lyrics))
 
     async def get_diagnostics(self) -> dict[str, SerializableType] | None:
         """Return diagnostics info for this controller to include in diagnostics reports."""
@@ -518,14 +518,14 @@ class MetaDataController(
         if not any(initial_lyrics):
             if track.provider == "library":
                 track, initial_lyrics = await self._get_library_track_lyrics(track)
+                if not prefer_synced:
+                    return initial_lyrics
             else:
                 track, initial_lyrics = await self._get_track_provider_lyrics(track)
 
         if any(initial_lyrics):
-            if not prefer_synced or initial_lyrics[1] or extract_lrc_lyrics(initial_lyrics[0]):
+            if not prefer_synced or get_lrc_lyrics(*initial_lyrics):
                 return initial_lyrics
-        elif track.provider == "library" and not prefer_synced:
-            return initial_lyrics
 
         return await self._search_metadata_provider_lyrics(track, initial_lyrics, prefer_synced)
 
@@ -622,7 +622,7 @@ class MetaDataController(
                 continue
             if fallback is None:
                 fallback = result
-            if not prefer_synced or metadata.lrc_lyrics or extract_lrc_lyrics(metadata.lyrics):
+            if not prefer_synced or get_lrc_lyrics(metadata.lyrics, metadata.lrc_lyrics):
                 return metadata.lyrics or fallback[0], metadata.lrc_lyrics
         return fallback or (None, None)
 
