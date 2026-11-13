@@ -387,6 +387,102 @@ async def test_remote_lyrics_lookup_can_stop_at_first_plain_result(
     second.get_track_metadata.assert_not_awaited()
 
 
+@pytest.mark.parametrize("stopping_stage", range(3), ids=["library", "provider", "remote"])
+async def test_lookup_stages_share_synced_completion_rule(
+    metadata_controller: MetaDataController,
+    monkeypatch: pytest.MonkeyPatch,
+    stopping_stage: int,
+) -> None:
+    """Every lookup stage stops the orchestration when it finds synchronized lyrics."""
+    _set_lyrics_config(metadata_controller, monkeypatch)
+    track = create_track("spotify", "t1")
+    lookups = [AsyncMock(return_value=(track, None, None, False)) for _ in range(3)]
+    lookups[stopping_stage].return_value = (
+        track,
+        None,
+        "[00:01.00]synchronized",
+        False,
+    )
+    for name, lookup in zip(
+        ("_get_library_track_lyrics", "_get_provider_track_lyrics", "_search_remote_lyrics"),
+        lookups,
+        strict=True,
+    ):
+        monkeypatch.setattr(metadata_controller, name, lookup)
+
+    assert await metadata_controller.get_track_lyrics(track) == (None, "[00:01.00]synchronized")
+    for lookup in lookups[: stopping_stage + 1]:
+        lookup.assert_awaited_once_with(track)
+    for lookup in lookups[stopping_stage + 1 :]:
+        lookup.assert_not_awaited()
+
+
+@pytest.mark.parametrize("stopping_stage", range(3), ids=["library", "provider", "remote"])
+async def test_lookup_stages_share_plain_lyrics_completion_when_preference_is_off(
+    metadata_controller: MetaDataController,
+    monkeypatch: pytest.MonkeyPatch,
+    stopping_stage: int,
+) -> None:
+    """Every lookup stage stops at plain lyrics when synchronized lyrics are not preferred."""
+    _set_lyrics_config(metadata_controller, monkeypatch, prefer_synced=False)
+    track = create_track("spotify", "t1")
+    lookups = [AsyncMock(return_value=(track, None, None, False)) for _ in range(3)]
+    lookups[stopping_stage].return_value = (track, "plain lyrics", None, False)
+    for name, lookup in zip(
+        ("_get_library_track_lyrics", "_get_provider_track_lyrics", "_search_remote_lyrics"),
+        lookups,
+        strict=True,
+    ):
+        monkeypatch.setattr(metadata_controller, name, lookup)
+
+    assert await metadata_controller.get_track_lyrics(track) == ("plain lyrics", None)
+    for lookup in lookups[: stopping_stage + 1]:
+        lookup.assert_awaited_once_with(track)
+    for lookup in lookups[stopping_stage + 1 :]:
+        lookup.assert_not_awaited()
+
+
+async def test_lookup_stages_protect_local_override(
+    metadata_controller: MetaDataController,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plain local override stops lookup even when synchronized lyrics are preferred."""
+    _set_lyrics_config(metadata_controller, monkeypatch)
+    track = create_track("library", "1")
+    library_lookup = AsyncMock(return_value=(track, "local lyrics", None, True))
+    provider_lookup = AsyncMock()
+    remote_lookup = AsyncMock()
+    monkeypatch.setattr(metadata_controller, "_get_library_track_lyrics", library_lookup)
+    monkeypatch.setattr(metadata_controller, "_get_provider_track_lyrics", provider_lookup)
+    monkeypatch.setattr(metadata_controller, "_search_remote_lyrics", remote_lookup)
+
+    assert await metadata_controller.get_track_lyrics(track) == ("local lyrics", None)
+    provider_lookup.assert_not_awaited()
+    remote_lookup.assert_not_awaited()
+
+
+async def test_lookup_stages_keep_first_plain_result_and_pass_refreshed_track(
+    metadata_controller: MetaDataController,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Later empty or plain results do not replace the first fallback or stale track."""
+    _set_lyrics_config(metadata_controller, monkeypatch)
+    original_track = create_track("library", "1")
+    refreshed_track = create_track("library", "1", name="Refreshed")
+    refreshed_track.provider = "library"
+    library_lookup = AsyncMock(return_value=(refreshed_track, "library plain", None, False))
+    provider_lookup = AsyncMock(return_value=(refreshed_track, None, None, False))
+    remote_lookup = AsyncMock(return_value=(refreshed_track, "remote plain", None, False))
+    monkeypatch.setattr(metadata_controller, "_get_library_track_lyrics", library_lookup)
+    monkeypatch.setattr(metadata_controller, "_get_provider_track_lyrics", provider_lookup)
+    monkeypatch.setattr(metadata_controller, "_search_remote_lyrics", remote_lookup)
+
+    assert await metadata_controller.get_track_lyrics(original_track) == ("library plain", None)
+    library_lookup.assert_awaited_once_with(original_track)
+    provider_lookup.assert_awaited_once_with(refreshed_track)
+    remote_lookup.assert_awaited_once_with(refreshed_track)
+
+
 async def test_lyrics_of_a_library_track_refresh_the_stored_item(
     metadata_controller: MetaDataController, mass_minimal: MusicAssistant
 ) -> None:

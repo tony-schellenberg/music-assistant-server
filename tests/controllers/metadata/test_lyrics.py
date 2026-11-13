@@ -240,7 +240,28 @@ async def test_direct_provider_lyrics_lookup(
     get_provider_item = AsyncMock(return_value=full_track)
     monkeypatch.setattr(mass.music.tracks, "get_provider_item", get_provider_item)
 
-    result = await metadata_controller._get_track_lyrics(track)
+    result = await metadata_controller._get_provider_track_lyrics(track)
 
     assert result == (track, expected_lyrics, None, expected_local_override)
     assert get_provider_item.await_count == expected_fetches
+
+
+async def test_provider_lookup_skips_library_tracks(
+    metadata_controller: MetaDataController,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The provider stage does not repeat lookup for tracks handled by the library stage."""
+    mass = metadata_controller.mass
+    mass.music = MusicController(mass)
+    get_provider_item = AsyncMock()
+    monkeypatch.setattr(mass.music.tracks, "get_provider_item", get_provider_item)
+    track = create_track("library", "library-track")
+    track.provider = "library"
+
+    assert await metadata_controller._get_provider_track_lyrics(track) == (
+        track,
+        None,
+        None,
+        False,
+    )
+    get_provider_item.assert_not_awaited()

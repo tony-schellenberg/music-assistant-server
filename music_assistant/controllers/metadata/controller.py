@@ -482,20 +482,23 @@ class MetaDataController(
 
         Returns a tuple of (lyrics, lrc_lyrics) if found.
         """
-        prefer_synced = bool(self.config.get_value(CONF_PREFER_SYNCED_LYRICS, True))
-        track, lyrics, lrc_lyrics, local_override = await self._get_track_lyrics(track)
-        has_synced_lyrics = bool(lrc_lyrics or extract_lrc_lyrics(lyrics))
-        if not local_override and (
-            not (lyrics or lrc_lyrics) or (prefer_synced and not has_synced_lyrics)
+        fallback: tuple[str | None, str | None] | None = None
+        for lookup in (
+            self._get_library_track_lyrics,
+            self._get_provider_track_lyrics,
+            self._search_remote_lyrics,
         ):
-            if track.provider != "library" or self.config.get_value(CONF_ENABLE_ONLINE_METADATA):
-                remote_lyrics = await self._search_remote_lyrics(track, prefer_synced)
-                if remote_lyrics and (
-                    not (lyrics or lrc_lyrics)
-                    or remote_lyrics[1]
-                    or extract_lrc_lyrics(remote_lyrics[0])
-                ):
-                    lyrics, lrc_lyrics = remote_lyrics
+            track, lyrics, lrc_lyrics, local_override = await lookup(track)
+            if lyrics or lrc_lyrics:
+                if fallback is None:
+                    fallback = lyrics, lrc_lyrics
+                if self._lyrics_lookup_complete(lyrics, lrc_lyrics, local_override):
+                    fallback = lyrics, lrc_lyrics
+                    break
+        if fallback is not None:
+            lyrics, lrc_lyrics = fallback
+        else:
+            lyrics, lrc_lyrics = None, None
         # on-demand lookups are not stored in the library db, so normalize on the way out
         # promoting LRC formatted text stored in the plain lyrics tag
         return lyrics, normalize_lrc_lyrics(lrc_lyrics or extract_lrc_lyrics(lyrics))
@@ -514,25 +517,32 @@ class MetaDataController(
             )
         return diagnostics
 
-    async def _get_track_lyrics(
-        self,
-        track: Track,
+    async def _get_library_track_lyrics(
+        self, track: Track
     ) -> tuple[Track, str | None, str | None, bool]:
-        """Look up (lyrics, lrc_lyrics) for the given track."""
+        """Get lyrics from the library item, refreshing it first when applicable."""
+        if track.provider != "library":
+            return track, None, None, False
+        # the stored item is refreshed, never the caller's copy of it; the refresh fills
+        # the household's library item from all its sources, so it runs as the server
+        track = await self.mass.music.tracks.get(
+            track.item_id, "library", allow_update_metadata=False
+        )
+        with system_auth_context():
+            await self._update_track_metadata(track, force_refresh=False)
+
+        local_lyrics = await self._get_local_track_lyrics(track)
+        if local_lyrics is not None:
+            lyrics, lrc_lyrics = local_lyrics
+            return track, lyrics, lrc_lyrics, True
+        return track, track.metadata.lyrics, track.metadata.lrc_lyrics, False
+
+    async def _get_provider_track_lyrics(
+        self, track: Track
+    ) -> tuple[Track, str | None, str | None, bool]:
+        """Get lyrics from the track's visible music provider, when available."""
         if track.provider == "library":
-            # the stored item is refreshed, never the caller's copy of it; the refresh fills
-            # the household's library item from all its sources, so it runs as the server
-            track = await self.mass.music.tracks.get(
-                track.item_id, "library", allow_update_metadata=False
-            )
-            with system_auth_context():
-                await self._update_track_metadata(track, force_refresh=False)
-
-            local_lyrics = await self._get_local_track_lyrics(track)
-            if local_lyrics is not None:
-                return track, local_lyrics[0], local_lyrics[1], True
-            return track, track.metadata.lyrics, track.metadata.lrc_lyrics, False
-
+            return track, None, None, False
         provider = self.mass.music.get_visible_provider(track.provider)
         if isinstance(provider, MusicProvider) and (
             provider.domain.startswith("filesystem_")
@@ -583,9 +593,11 @@ class MetaDataController(
         return None
 
     async def _search_remote_lyrics(
-        self, track: Track, prefer_synced: bool
-    ) -> tuple[str | None, str | None] | None:
-        """Search metadata providers for lyrics, preferring synchronized results when requested."""
+        self, track: Track
+    ) -> tuple[Track, str | None, str | None, bool]:
+        """Search metadata providers for lyrics."""
+        if track.provider == "library" and not self.config.get_value(CONF_ENABLE_ONLINE_METADATA):
+            return track, None, None, False
         lookup_track = replace(
             track,
             metadata=replace(track.metadata, lyrics=None, lrc_lyrics=None),
@@ -608,12 +620,26 @@ class MetaDataController(
             if not metadata or not (metadata.lyrics or metadata.lrc_lyrics):
                 continue
             lyrics = (metadata.lyrics, metadata.lrc_lyrics)
-            has_synced_lyrics = bool(metadata.lrc_lyrics or extract_lrc_lyrics(metadata.lyrics))
-            if not prefer_synced or has_synced_lyrics:
-                return lyrics
+            if self._lyrics_lookup_complete(*lyrics):
+                return track, *lyrics, False
             if plain_fallback is None:
                 plain_fallback = lyrics
-        return plain_fallback
+        if plain_fallback is not None:
+            return track, *plain_fallback, False
+        return track, None, None, False
+
+    def _lyrics_lookup_complete(
+        self,
+        lyrics: str | None,
+        lrc_lyrics: str | None,
+        local_override: bool = False,
+    ) -> bool:
+        """Return whether these lyrics satisfy the configured lookup preference."""
+        if local_override or lrc_lyrics or extract_lrc_lyrics(lyrics):
+            return True
+        return bool(lyrics or lrc_lyrics) and not bool(
+            self.config.get_value(CONF_PREFER_SYNCED_LYRICS, True)
+        )
 
     def _register_maintenance_tasks(self) -> None:
         """Register the recurring metadata maintenance background tasks."""
