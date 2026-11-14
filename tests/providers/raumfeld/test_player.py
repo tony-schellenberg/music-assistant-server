@@ -923,12 +923,19 @@ async def test_own_stream_is_not_an_external_source() -> None:
     assert player._attr_active_source is None
 
 
-async def test_zone_playback_from_the_raumfeld_app_is_followed() -> None:
+@pytest.mark.parametrize("play_mode", ["NORMAL", None])
+async def test_zone_playback_from_the_raumfeld_app_is_followed(play_mode: str | None) -> None:
     """Playback the host started is reported, without the address it streams from."""
     player, _ = _external_player()
     track_uri = "https://audio.example.com/track.flac?token=secret"
-    with patch.object(player, "_read_zone_actions", AsyncMock(return_value="Pause,Next")):
+    with (
+        patch.object(player, "_read_zone_actions", AsyncMock(return_value="Pause,Next")),
+        patch.object(
+            player, "_read_zone_play_mode", AsyncMock(return_value=play_mode)
+        ) as read_mode,
+    ):
         await player._update_zone_source({"TrackURI": track_uri, "TrackMetaData": ""}, ["Bar"], 0)
+    read_mode.assert_awaited_once_with(["Bar"])
     assert player._attr_active_source == "raumfeld"
     assert PlayerFeature.PAUSE in player._attr_supported_features
     assert player._attr_current_media is not None
@@ -1014,7 +1021,10 @@ async def test_a_stopped_zone_source_stays_loaded() -> None:
     """A source the host still has loaded stays the active source while it is stopped."""
     player, _ = _external_player()
     player._attr_playback_state = PlaybackState.IDLE
-    with patch.object(player, "_read_zone_actions", AsyncMock(return_value="Play")):
+    with (
+        patch.object(player, "_read_zone_actions", AsyncMock(return_value="Play")),
+        patch.object(player, "_read_zone_play_mode", AsyncMock(return_value="NORMAL")),
+    ):
         await player._update_zone_source(
             {"TrackURI": "https://radio.example.com/stream", "TrackMetaData": ""},
             ["Bar"],
@@ -1188,6 +1198,7 @@ async def test_a_reading_older_than_a_play_command_is_not_adopted() -> None:
 
     with (
         patch.object(player, "_read_zone_actions", side_effect=actions_while_play_media_runs),
+        patch.object(player, "_read_zone_play_mode", AsyncMock(return_value="NORMAL")),
         patch.object(player, "_clear_next") as clear_next,
     ):
         await player._update_zone_source(
@@ -1503,7 +1514,10 @@ async def test_a_poll_during_a_play_command_is_not_applied() -> None:
     """Readings a poll takes while MA is still starting its own item are discarded."""
     player, _ = _external_player()
     player._playback_changes = 1
-    with patch.object(player, "_read_zone_actions", AsyncMock(return_value="Pause")):
+    with (
+        patch.object(player, "_read_zone_actions", AsyncMock(return_value="Pause")),
+        patch.object(player, "_read_zone_play_mode", AsyncMock(return_value="NORMAL")),
+    ):
         await player._update_zone_source(
             {"TrackURI": "https://radio.example.com/stream", "TrackMetaData": ""},
             ["Bar"],
