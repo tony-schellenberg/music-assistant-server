@@ -18,6 +18,13 @@ if TYPE_CHECKING:
     from music_assistant.controllers.metadata import MetaDataController
 
 
+PLAIN_LYRICS = "plain lyrics"
+SYNCED_LYRICS = "[00:01.00]synchronized lyrics"
+METADATA_LYRICS = "metadata lyrics"
+PROVIDER_PLAIN_LYRICS = "provider plain lyrics"
+METADATA_SYNCED_LYRICS = "[00:02.00]metadata synchronized lyrics"
+
+
 def _set_prefer_synced_lyrics(
     metadata_controller: MetaDataController,
     monkeypatch: pytest.MonkeyPatch,
@@ -45,12 +52,15 @@ def _setup_metadata_providers(
     metadata_controller: MetaDataController,
     monkeypatch: pytest.MonkeyPatch,
     *providers: MagicMock,
-) -> None:
+    visible_provider: MagicMock | None = None,
+) -> MagicMock:
     """Set up provider access for an on-demand lookup."""
     mass = metadata_controller.mass
     mass.music = MusicController(mass)
-    monkeypatch.setattr(mass.music, "get_visible_provider", MagicMock(return_value=None))
+    get_visible_provider = MagicMock(return_value=visible_provider)
+    monkeypatch.setattr(mass.music, "get_visible_provider", get_visible_provider)
     monkeypatch.setattr(mass, "get_providers", MagicMock(return_value=list(providers)))
+    return get_visible_provider
 
 
 async def test_plain_lyrics_remain_the_fallback_when_preference_is_disabled(
@@ -58,15 +68,13 @@ async def test_plain_lyrics_remain_the_fallback_when_preference_is_disabled(
 ) -> None:
     """Without the preference, the first available lyrics are returned as before."""
     _set_prefer_synced_lyrics(metadata_controller, monkeypatch, False)
-    plain_provider = _metadata_provider("plain", MediaItemMetadata(lyrics="plain lyrics"))
-    synced_provider = _metadata_provider(
-        "synced", MediaItemMetadata(lrc_lyrics="[00:01.00]synchronized lyrics")
-    )
+    plain_provider = _metadata_provider("plain", MediaItemMetadata(lyrics=PLAIN_LYRICS))
+    synced_provider = _metadata_provider("synced", MediaItemMetadata(lrc_lyrics=SYNCED_LYRICS))
     _setup_metadata_providers(metadata_controller, monkeypatch, plain_provider, synced_provider)
 
     result = await metadata_controller.get_track_lyrics(create_track("spotify_test", "track"))
 
-    assert result == ("plain lyrics", None)
+    assert result == (PLAIN_LYRICS, None)
     plain_provider.get_track_metadata.assert_awaited_once()
     synced_provider.get_track_metadata.assert_not_awaited()
 
@@ -76,15 +84,13 @@ async def test_preference_continues_after_plain_lyrics_and_keeps_them_as_fallbac
 ) -> None:
     """A later synchronized result wins while the first plain lyrics remain available."""
     _set_prefer_synced_lyrics(metadata_controller, monkeypatch, True)
-    plain_provider = _metadata_provider("plain", MediaItemMetadata(lyrics="plain lyrics"))
-    synced_provider = _metadata_provider(
-        "synced", MediaItemMetadata(lrc_lyrics="[00:01.00]synchronized lyrics")
-    )
+    plain_provider = _metadata_provider("plain", MediaItemMetadata(lyrics=PLAIN_LYRICS))
+    synced_provider = _metadata_provider("synced", MediaItemMetadata(lrc_lyrics=SYNCED_LYRICS))
     _setup_metadata_providers(metadata_controller, monkeypatch, plain_provider, synced_provider)
 
     result = await metadata_controller.get_track_lyrics(create_track("spotify_test", "track"))
 
-    assert result == ("plain lyrics", "[00:01.00]synchronized lyrics")
+    assert result == (PLAIN_LYRICS, SYNCED_LYRICS)
     plain_provider.get_track_metadata.assert_awaited_once()
     synced_provider.get_track_metadata.assert_awaited_once()
 
@@ -94,13 +100,15 @@ async def test_first_plain_lyrics_are_returned_when_no_provider_has_synced_lyric
 ) -> None:
     """The earliest plain result remains the fallback if the search finds no LRC."""
     _set_prefer_synced_lyrics(metadata_controller, monkeypatch, True)
-    first_provider = _metadata_provider("first", MediaItemMetadata(lyrics="first plain lyrics"))
-    next_provider = _metadata_provider("next", MediaItemMetadata(lyrics="later plain lyrics"))
+    first_lyrics = "first plain lyrics"
+    later_lyrics = "later plain lyrics"
+    first_provider = _metadata_provider("first", MediaItemMetadata(lyrics=first_lyrics))
+    next_provider = _metadata_provider("next", MediaItemMetadata(lyrics=later_lyrics))
     _setup_metadata_providers(metadata_controller, monkeypatch, first_provider, next_provider)
 
     result = await metadata_controller.get_track_lyrics(create_track("spotify_test", "track"))
 
-    assert result == ("first plain lyrics", None)
+    assert result == (first_lyrics, None)
     first_provider.get_track_metadata.assert_awaited_once()
     next_provider.get_track_metadata.assert_awaited_once()
 
@@ -108,8 +116,8 @@ async def test_first_plain_lyrics_are_returned_when_no_provider_has_synced_lyric
 @pytest.mark.parametrize(
     "metadata",
     [
-        MediaItemMetadata(lrc_lyrics="[00:01.00]synchronized lyrics"),
-        MediaItemMetadata(lyrics="[00:01.00]synchronized lyrics"),
+        MediaItemMetadata(lrc_lyrics=SYNCED_LYRICS),
+        MediaItemMetadata(lyrics=SYNCED_LYRICS),
     ],
     ids=["lrc-field", "timestamped-plain-field"],
 )
@@ -121,14 +129,15 @@ async def test_synchronized_lyrics_stop_provider_search(
     """Both synchronized fields are recognized, including LRC text in the plain field."""
     _set_prefer_synced_lyrics(metadata_controller, monkeypatch, True)
     first_provider = _metadata_provider("first", metadata)
-    next_provider = _metadata_provider("next", MediaItemMetadata(lyrics="later lyrics"))
+    later_lyrics = "later lyrics"
+    next_provider = _metadata_provider("next", MediaItemMetadata(lyrics=later_lyrics))
     _setup_metadata_providers(metadata_controller, monkeypatch, first_provider, next_provider)
 
     result = await metadata_controller.get_track_lyrics(create_track("spotify_test", "track"))
 
     assert result == (
-        "[00:01.00]synchronized lyrics" if metadata.lyrics else None,
-        "[00:01.00]synchronized lyrics",
+        SYNCED_LYRICS if metadata.lyrics else None,
+        SYNCED_LYRICS,
     )
     next_provider.get_track_metadata.assert_not_awaited()
 
@@ -139,14 +148,12 @@ async def test_provider_failure_does_not_prevent_later_synchronized_lyrics(
     """A failed lyrics provider is skipped while the ordered search continues."""
     _set_prefer_synced_lyrics(metadata_controller, monkeypatch, True)
     broken_provider = _metadata_provider("broken", RuntimeError("provider unavailable"))
-    synced_provider = _metadata_provider(
-        "synced", MediaItemMetadata(lrc_lyrics="[00:01.00]synchronized lyrics")
-    )
+    synced_provider = _metadata_provider("synced", MediaItemMetadata(lrc_lyrics=SYNCED_LYRICS))
     _setup_metadata_providers(metadata_controller, monkeypatch, broken_provider, synced_provider)
 
     assert await metadata_controller.get_track_lyrics(create_track("spotify_test", "track")) == (
         None,
-        "[00:01.00]synchronized lyrics",
+        SYNCED_LYRICS,
     )
     synced_provider.get_track_metadata.assert_awaited_once()
 
@@ -156,20 +163,19 @@ async def test_provider_search_does_not_mutate_track_lyrics(
 ) -> None:
     """Existing plain lyrics are retained on the caller while providers receive a clean copy."""
     _set_prefer_synced_lyrics(metadata_controller, monkeypatch, True)
-    synced_provider = _metadata_provider(
-        "synced", MediaItemMetadata(lrc_lyrics="[00:01.00]synchronized lyrics")
-    )
+    synced_provider = _metadata_provider("synced", MediaItemMetadata(lrc_lyrics=SYNCED_LYRICS))
     _setup_metadata_providers(metadata_controller, monkeypatch, synced_provider)
     track = create_track("spotify_test", "track")
-    track.metadata.lyrics = "cached plain lyrics"
+    cached_lyrics = "cached plain lyrics"
+    track.metadata.lyrics = cached_lyrics
 
     result = await metadata_controller.get_track_lyrics(track)
 
     provider_track = synced_provider.get_track_metadata.await_args.args[0]
     assert provider_track is not track
     assert provider_track.metadata.lyrics is None
-    assert track.metadata.lyrics == "cached plain lyrics"
-    assert result == ("cached plain lyrics", "[00:01.00]synchronized lyrics")
+    assert track.metadata.lyrics == cached_lyrics
+    assert result == (cached_lyrics, SYNCED_LYRICS)
 
 
 async def test_cached_synchronized_lyrics_stop_source_lookup(
@@ -178,15 +184,14 @@ async def test_cached_synchronized_lyrics_stop_source_lookup(
     """Synchronized lyrics already on the supplied track are immediately authoritative."""
     _set_prefer_synced_lyrics(metadata_controller, monkeypatch, True)
     provider = _metadata_provider("metadata", MediaItemMetadata(lyrics="other lyrics"))
-    _setup_metadata_providers(metadata_controller, monkeypatch, provider)
-    visible_provider = MagicMock(return_value=None)
-    monkeypatch.setattr(metadata_controller.mass.music, "get_visible_provider", visible_provider)
+    visible_provider = _setup_metadata_providers(metadata_controller, monkeypatch, provider)
     track = create_track("spotify_test", "track")
-    track.metadata.lrc_lyrics = "[00:01.00]cached synchronized lyrics"
+    cached_synced_lyrics = "[00:01.00]cached synchronized lyrics"
+    track.metadata.lrc_lyrics = cached_synced_lyrics
 
     assert await metadata_controller.get_track_lyrics(track) == (
         None,
-        "[00:01.00]cached synchronized lyrics",
+        cached_synced_lyrics,
     )
     visible_provider.assert_not_called()
     provider.get_track_metadata.assert_not_awaited()
@@ -194,7 +199,7 @@ async def test_cached_synchronized_lyrics_stop_source_lookup(
 
 @pytest.mark.parametrize(
     ("prefer_synced", "expected"),
-    [(False, (None, None)), (True, ("metadata lyrics", None))],
+    [(False, (None, None)), (True, (METADATA_LYRICS, None))],
     ids=["default-stops", "preference-searches"],
 )
 async def test_library_without_lyrics_only_searches_when_preference_is_enabled(
@@ -205,7 +210,7 @@ async def test_library_without_lyrics_only_searches_when_preference_is_enabled(
 ) -> None:
     """A library refresh without lyrics stops by default and searches when opted in."""
     _set_prefer_synced_lyrics(metadata_controller, monkeypatch, prefer_synced)
-    provider = _metadata_provider("metadata", MediaItemMetadata(lyrics="metadata lyrics"))
+    provider = _metadata_provider("metadata", MediaItemMetadata(lyrics=METADATA_LYRICS))
     _setup_metadata_providers(metadata_controller, monkeypatch, provider)
     library_track = create_track("spotify_test", "track")
     library_track.provider = "library"
@@ -228,12 +233,12 @@ async def test_library_without_lyrics_only_searches_when_preference_is_enabled(
 @pytest.mark.parametrize(
     ("prefer_synced", "expected"),
     [
-        (False, ("provider plain lyrics", None)),
-        (True, ("provider plain lyrics", "[00:02.00]metadata synchronized lyrics")),
+        (False, (PROVIDER_PLAIN_LYRICS, None)),
+        (True, (PROVIDER_PLAIN_LYRICS, METADATA_SYNCED_LYRICS)),
     ],
     ids=["default-stops", "preference-searches"],
 )
-async def test_track_provider_lyrics_control_metadata_provider_search(
+async def test_plain_track_provider_lyrics_only_stop_search_when_preference_is_disabled(
     metadata_controller: MetaDataController,
     monkeypatch: pytest.MonkeyPatch,
     prefer_synced: bool,
@@ -241,19 +246,22 @@ async def test_track_provider_lyrics_control_metadata_provider_search(
 ) -> None:
     """Own-provider lyrics stop by default and remain fallback when searching for sync."""
     _set_prefer_synced_lyrics(metadata_controller, monkeypatch, prefer_synced)
-    mass = metadata_controller.mass
-    mass.music = MusicController(mass)
     track_provider = MagicMock(spec=MusicProvider)
     track_provider.supported_features = {ProviderFeature.LYRICS}
-    monkeypatch.setattr(mass.music, "get_visible_provider", MagicMock(return_value=track_provider))
     provider_track = create_track("spotify_test", "track", name="Fetched track")
-    provider_track.metadata.lyrics = "provider plain lyrics"
+    provider_track.metadata.lyrics = PROVIDER_PLAIN_LYRICS
     get_provider_item = AsyncMock(return_value=provider_track)
-    monkeypatch.setattr(mass.music.tracks, "get_provider_item", get_provider_item)
     metadata_provider = _metadata_provider(
-        "metadata", MediaItemMetadata(lrc_lyrics="[00:02.00]metadata synchronized lyrics")
+        "metadata", MediaItemMetadata(lrc_lyrics=METADATA_SYNCED_LYRICS)
     )
-    monkeypatch.setattr(mass, "get_providers", MagicMock(return_value=[metadata_provider]))
+    _setup_metadata_providers(
+        metadata_controller,
+        monkeypatch,
+        metadata_provider,
+        visible_provider=track_provider,
+    )
+    mass = metadata_controller.mass
+    monkeypatch.setattr(mass.music.tracks, "get_provider_item", get_provider_item)
 
     result = await metadata_controller.get_track_lyrics(create_track("spotify_test", "track"))
 
@@ -264,7 +272,7 @@ async def test_track_provider_lyrics_control_metadata_provider_search(
         searched_track = metadata_provider.get_track_metadata.await_args.args[0]
         assert searched_track.name == "Fetched track"
         assert searched_track.metadata.lyrics is None
-        assert provider_track.metadata.lyrics == "provider plain lyrics"
+        assert provider_track.metadata.lyrics == PROVIDER_PLAIN_LYRICS
     else:
         metadata_provider.get_track_metadata.assert_not_awaited()
 
@@ -282,17 +290,20 @@ async def test_filesystem_lyrics_override_remote_results_for_library_track(
 ) -> None:
     """Visible local tags or sidecars remain authoritative for mapped library tracks."""
     _set_prefer_synced_lyrics(metadata_controller, monkeypatch, True)
-    mass = metadata_controller.mass
-    mass.music = MusicController(mass)
     filesystem = MagicMock(spec=MusicProvider)
     filesystem.domain = "filesystem_local"
     filesystem.instance_id = "filesystem_local_test"
     filesystem.name = "Local files"
-    monkeypatch.setattr(mass.music, "get_visible_provider", MagicMock(return_value=filesystem))
     remote = _metadata_provider(
         "remote", MediaItemMetadata(lrc_lyrics="[00:02.00]remote synchronized lyrics")
     )
-    monkeypatch.setattr(mass, "get_providers", MagicMock(return_value=[remote]))
+    _setup_metadata_providers(
+        metadata_controller,
+        monkeypatch,
+        remote,
+        visible_provider=filesystem,
+    )
+    mass = metadata_controller.mass
 
     track = create_track("spotify_test", "track")
     track.provider = "library"
@@ -304,7 +315,8 @@ async def test_filesystem_lyrics_override_remote_results_for_library_track(
             provider_instance="filesystem_local_test",
         )
     }
-    track.metadata.lyrics = "cached plain lyrics"
+    cached_lyrics = "cached plain lyrics"
+    track.metadata.lyrics = cached_lyrics
     local_track = create_track("filesystem_local_test", "local-track")
     local_track.metadata.lyrics = local_lyrics
     local_track.metadata.lrc_lyrics = local_lrc_lyrics
@@ -316,4 +328,4 @@ async def test_filesystem_lyrics_override_remote_results_for_library_track(
     assert await metadata_controller.get_track_lyrics(track) == (local_lyrics, local_lrc_lyrics)
     get_provider_item.assert_awaited_once()
     remote.get_track_metadata.assert_not_awaited()
-    assert track.metadata.lyrics == "cached plain lyrics"
+    assert track.metadata.lyrics == cached_lyrics
